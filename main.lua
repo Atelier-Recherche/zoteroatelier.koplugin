@@ -15,6 +15,8 @@ local Geom = require("ui/geometry")
 local _ = require("gettext")
 local ZoteroAPI = require("zoteroapi")
 local itemInfoViewer = require("zoteroiteminfo")
+local AnnotationPanel = require("annotation_panel")
+local AnnotationSearch = require("annotation_search")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
 local ButtonDialog = require("ui/widget/buttondialog")
 local lfs = require("libs/libkoreader-lfs")
@@ -33,18 +35,40 @@ local table_empty = function(table)
     return (next(table) == nil)
 end
 
--- Function to disable PDF annotation writing for Zotero files
+local function truncatePath(p, max_len)
+    max_len = max_len or 40
+    if p == nil or p == "" then
+        return _("(not set)")
+    end
+    if #p <= max_len then
+        return p
+    end
+    return "…" .. p:sub(-max_len + 2)
+end
+
+-- Optionally disable writing highlights into the PDF file itself.
+-- Default: leave KOReader's write-into-PDF setting alone (auto_disable = false).
+-- When write-into-PDF is allowed (auto_disable false), enable it on Zotero PDFs.
 local function configureZoteroDocumentSettings(file_path)
     if file_path and file_path:match("%.pdf$") then
-        -- Check if auto-disable setting is enabled
-        local auto_disable = ZoteroAPI.getSettings():readSetting("auto_disable_pdf_writing", true)
+        local auto_disable = ZoteroAPI.getSettings():readSetting("auto_disable_pdf_writing", false)
+        local doc_settings = DocSettings:open(file_path)
         if auto_disable then
-            logger.info("Zotero: Configuring PDF settings for Zotero document: " .. file_path)
-            local doc_settings = DocSettings:open(file_path)
+            logger.info("Zotero: Disabling PDF annotation writing for: " .. file_path)
             doc_settings:saveSetting("highlight_write_into_pdf", false)
-            doc_settings:flush()
-            logger.info("Zotero: Disabled PDF annotation writing for Zotero document")
+        else
+            logger.info("Zotero: Enabling PDF annotation writing for: " .. file_path)
+            doc_settings:saveSetting("highlight_write_into_pdf", true)
         end
+        doc_settings:flush()
+    end
+end
+
+local function enableWriteIntoPdf(file_path)
+    if file_path and file_path:match("%.pdf$") then
+        local doc_settings = DocSettings:open(file_path)
+        doc_settings:saveSetting("highlight_write_into_pdf", true)
+        doc_settings:flush()
     end
 end
 
@@ -112,24 +136,57 @@ function ZoteroBrowser:onReturn()
     return true
 end
 
+function ZoteroBrowser:openResolvedFile(full_path)
+    if self.download_dialog then
+        UIManager:close(self.download_dialog)
+        self.download_dialog = nil
+    end
+    configureZoteroDocumentSettings(full_path)
+    local close_cb = self.close_callback
+    UIManager:scheduleIn(0.05, function()
+        if close_cb then
+            close_cb()
+        end
+        require("apps/reader/readerui"):showReader(full_path)
+    end)
+end
+
+function ZoteroBrowser:showOpenError(e)
+    local err_text = ""
+    if e ~= nil then
+        err_text = " " .. tostring(e)
+    end
+    UIManager:show(InfoMessage:new({
+        text = _("Could not open file.") .. err_text,
+        timeout = 5,
+        icon = "notice-warning",
+    }))
+end
+
 function ZoteroBrowser:openAttachment(key)
+    local local_path, local_err = ZoteroAPI.tryResolveLocalAttachment(key)
+    if local_err ~= nil then
+        self:showOpenError(local_err)
+        return
+    end
+    if local_path then
+        self:openResolvedFile(local_path)
+        return
+    end
+
+    self.download_dialog = InfoMessage:new({
+        text = _("Downloading file"),
+        timeout = 5,
+        icon = "notice-info",
+    })
+    UIManager:show(self.download_dialog)
     NetworkMgr:runWhenOnline(function()
         local full_path, e = ZoteroAPI.downloadAndGetPath(key)
         if e ~= nil or full_path == nil then
-            local b = InfoMessage:new({
-                text = _("Could not open file.") .. e,
-                timeout = 5,
-                icon = "notice-warning",
-            })
-            UIManager:show(b)
-        else
-            assert(full_path ~= nil)
             UIManager:close(self.download_dialog)
-            configureZoteroDocumentSettings(full_path)
-
-            local ReaderUI = require("apps/reader/readerui")
-            self.close_callback()
-            ReaderUI:showReader(full_path)
+            self:showOpenError(e)
+        else
+            self:openResolvedFile(full_path)
         end
     end)
 end
@@ -144,43 +201,27 @@ function ZoteroBrowser:onMenuSelect(item)
         table.insert(self.keys, "all")
         self:displaySearchResults("")
     elseif item.type == "item" then
-        self.download_dialog = InfoMessage:new({
-            text = _("Downloading file"),
-            timeout = 5,
-            icon = "notice-info",
-        })
-        UIManager:scheduleIn(0.05, function()
-            NetworkMgr:runWhenOnline(function()
-                local attachments = ZoteroAPI.getItemAttachments(item.key)
-                if attachments == nil or table_empty(attachments) then
-                    local b = InfoMessage:new({
-                        text = _("The selected entry does not have any attachments."),
-                        timeout = 5,
-                        icon = "notice-warning",
-                    })
-                    UIManager:show(b)
-                    return
-                else
-                    -- Try to find and open a PDF attachment first
-                    local pdf_attachment = nil
-                    for _, attachment in ipairs(attachments) do
-                        if attachment.contentType == "application/pdf" or
-                            (attachment.filename and attachment.filename:match("%.pdf$")) then
-                            pdf_attachment = attachment
-                            break
-                        end
-                    end
-
-                    -- Open PDF if found, otherwise fall back to last attachment
-                    if pdf_attachment then
-                        self:openAttachment(pdf_attachment.key)
-                    else
-                        self:openAttachment(attachments[#attachments].key)
-                    end
-                end
-            end)
-        end)
-        UIManager:show(self.download_dialog)
+        local attachments = ZoteroAPI.getItemAttachments(item.key)
+        if attachments == nil or table_empty(attachments) then
+            UIManager:show(InfoMessage:new({
+                text = _("The selected entry does not have any attachments."),
+                timeout = 5,
+                icon = "notice-warning",
+            }))
+            return
+        end
+        local pdf_attachment = nil
+        for _, attachment in ipairs(attachments) do
+            if attachment.is_pdf then
+                pdf_attachment = attachment
+                break
+            end
+        end
+        if pdf_attachment then
+            self:openAttachment(pdf_attachment.key)
+        else
+            self:openAttachment(attachments[#attachments].key)
+        end
     elseif item.type == "attachment" then
         self:openAttachment(item.key)
     elseif item.type == "label" then
@@ -196,23 +237,7 @@ function ZoteroBrowser:onMenuHold(item)
         local itemDetails = ZoteroAPI.getItemWithAttachments(item.key)
         local itemInfo = itemInfoViewer:new()
         itemInfo:show(itemDetails, function(key)
-            NetworkMgr:runWhenOnline(function()
-                local full_path, e = ZoteroAPI.downloadAndGetPath(key)
-                if e ~= nil or full_path == nil then
-                    local b = InfoMessage:new({
-                        text = _("Could not open file.") .. e,
-                        timeout = 5,
-                        icon = "notice-warning",
-                    })
-                    UIManager:show(b)
-                else
-                    assert(full_path ~= nil)
-                    configureZoteroDocumentSettings(full_path)
-                    local ReaderUI = require("apps/reader/readerui")
-                    self.close_callback()
-                    ReaderUI:showReader(full_path)
-                end
-            end)
+            self:openAttachment(key)
         end)
     elseif item.type == "collection" then
         local is_offline_enabled = ZoteroAPI.isOfflineCollection(item.key)
@@ -308,7 +333,7 @@ function ZoteroBrowser:setItems(items, subtitle)
 end
 
 local Plugin = WidgetContainer:new({
-    name = "zotero",
+    name = "zoteroatelier",
     is_doc_only = false,
 })
 
@@ -316,15 +341,109 @@ function Plugin:onDispatcherRegisterActions()
     Dispatcher:registerAction("zotero_browser_action", {
         category = "none",
         event = "ZoteroBrowserAction",
-        title = _("Zotero Collection Browser"),
+        title = _("Zotero Atelier Collection Browser"),
         general = true,
     })
     Dispatcher:registerAction("zotero_sync_action", {
         category = "none",
         event = "ZoteroSyncAction",
-        title = _("Zotero Sync"),
+        title = _("Zotero Atelier Sync"),
         general = true,
     })
+end
+
+function Plugin:reloadReaderAnnotations(readerui)
+    if readerui and readerui.reloadDocument then
+        UIManager:scheduleIn(0.1, function()
+            readerui:reloadDocument()
+        end)
+    end
+end
+
+function Plugin:syncOpenDocumentAnnotations(readerui, opts)
+    opts = opts or {}
+    if not init_done or not readerui or not readerui.document or not readerui.document.file then
+        return
+    end
+    local file_path = readerui.document.file
+    local key = ZoteroAPI.findAttachmentKeyByFilePath(file_path)
+    if not key then
+        return
+    end
+    -- Flush live annotations to sidecar before upload
+    if readerui.annotation and readerui.annotation.annotations and readerui.doc_settings then
+        readerui.doc_settings:saveSetting("annotations", readerui.annotation.annotations)
+        readerui.doc_settings:flush()
+    end
+    NetworkMgr:runWhenOnline(function()
+        local ok, err = pcall(function()
+            return ZoteroAPI.syncAnnotationsForAttachment(key, file_path)
+        end)
+        if not ok then
+            logger.err("Zotero: syncAnnotationsForAttachment failed: ", err)
+            if opts.notify then
+                UIManager:show(InfoMessage:new({
+                    text = _("Annotation sync failed."),
+                    timeout = 3,
+                    icon = "notice-warning",
+                }))
+            end
+        elseif opts.notify then
+            UIManager:show(InfoMessage:new({
+                text = _("Annotations synced to Zotero."),
+                timeout = 2,
+                icon = "notice-info",
+            }))
+        end
+    end)
+end
+
+function Plugin:onReaderReady(readerui)
+    if not init_done or not readerui or not readerui.document or not readerui.document.file then
+        return
+    end
+    local file_path = readerui.document.file
+    local key = ZoteroAPI.findAttachmentKeyByFilePath(file_path)
+    if not key then
+        return
+    end
+    local item = ZoteroAPI.getItem(key)
+    if not item then
+        return
+    end
+    local doc_settings = DocSettings:open(file_path)
+    local sidecar_lib_version = doc_settings:readSetting("zoteroLibVersion", 0)
+    doc_settings:close()
+    logger.info("Zotero: Matched open document to attachment " .. key)
+    if sidecar_lib_version < ZoteroAPI.getUserLibraryVersion() then
+        local ok, err = pcall(function()
+            local result = ZoteroAPI.attachItemAnnotations(item, nil, file_path)
+            if result and result:match("^Error") then
+                logger.warn("Zotero: " .. tostring(result))
+            else
+                self:reloadReaderAnnotations(readerui)
+            end
+        end)
+        if not ok then
+            logger.err("Zotero: Failed to attach annotations on reader open: ", err)
+        end
+    end
+    -- Upload local create/edit/delete shortly after open (sidecar may have pending changes)
+    UIManager:scheduleIn(1.0, function()
+        self:syncOpenDocumentAnnotations(readerui, { notify = false })
+    end)
+end
+
+function Plugin:onCloseDocument()
+    if self.ui then
+        self:syncOpenDocumentAnnotations(self.ui, { notify = false })
+    end
+end
+
+function Plugin:onCloseWidget()
+    if self.ui then
+        self:syncOpenDocumentAnnotations(self.ui, { notify = false })
+    end
 end
 
 function Plugin:init()
@@ -350,8 +469,12 @@ end
 function Plugin:checkInitialized()
     if not self.initialized or self.browser == nil then
         UIManager:show(InfoMessage:new({
-            text = _("Zotero not initialized. Please set the plugin directory first."),
-            timeout = 3,
+            text = _(
+                "Zotero Atelier could not start.\n"
+                    .. "Restart KOReader after installing the plugin.\n"
+                    .. "If the problem persists, check crash.log for 'zoteroatelier' or 'zoteroapi' errors."
+            ),
+            timeout = 6,
             icon = "notice-warning",
         }))
     end
@@ -387,11 +510,8 @@ function Plugin:initBrowser()
     logger.dbg("Zotero: Browser initialized")
 end
 
-function Plugin:addToMainMenu(menu_items)
-    menu_items.zotero = {
-        text = _("Zotero"),
-        sorting_hint = "search",
-        sub_item_table = {
+function Plugin:getZoteroSubMenu()
+    return {
             {
                 text = _("Browse"),
                 callback = function()
@@ -402,6 +522,30 @@ function Plugin:addToMainMenu(menu_items)
                 text = _("Synchronize"),
                 callback = function()
                     self:onZoteroSyncAction()
+                end,
+            },
+            {
+                text = _("Document annotations"),
+                enabled_func = function()
+                    return self.ui ~= nil and self.ui.document ~= nil
+                end,
+                callback = function()
+                    AnnotationPanel.show(self.ui)
+                end,
+            },
+            {
+                text = _("Search annotations"),
+                callback = function()
+                    AnnotationSearch.show(self)
+                end,
+            },
+            {
+                text = _("Sync document annotations"),
+                enabled_func = function()
+                    return self.ui ~= nil and self.ui.document ~= nil
+                end,
+                callback = function()
+                    self:syncOpenDocumentAnnotations(self.ui, { notify = true })
                 end,
             },
             {
@@ -484,14 +628,157 @@ function Plugin:addToMainMenu(menu_items)
                         end,
                     },
                     {
-                        text = _("Auto-disable PDF annotation writing"),
+                        text = _("Write highlights into PDF files"),
                         checked_func = function()
-                            return ZoteroAPI.getSettings():readSetting("auto_disable_pdf_writing", true)
+                            return not ZoteroAPI.getSettings():readSetting("auto_disable_pdf_writing", false)
                         end,
                         callback = function()
-                            ZoteroAPI.getSettings():toggle("auto_disable_pdf_writing")
+                            local cur = ZoteroAPI.getSettings():readSetting("auto_disable_pdf_writing", false)
+                            ZoteroAPI.getSettings():saveSetting("auto_disable_pdf_writing", not cur)
                             ZoteroAPI.saveSettingsToFile()
+                            if self.ui and self.ui.document and self.ui.document.file then
+                                if not cur then
+                                    configureZoteroDocumentSettings(self.ui.document.file)
+                                else
+                                    enableWriteIntoPdf(self.ui.document.file)
+                                end
+                            end
                         end,
+                    },
+                    {
+                        text = _("Local files"),
+                        callback = function()
+                            return nil
+                        end,
+                        sub_item_table = {
+                            {
+                                text = _("Enable linked files folder"),
+                                checked_func = function()
+                                    return ZoteroAPI.getLinkedFilesEnabled()
+                                end,
+                                callback = function()
+                                    ZoteroAPI.toggleLinkedFilesEnabled()
+                                    ZoteroAPI.saveSettingsToFile()
+                                end,
+                            },
+                            {
+                                text_func = function()
+                                    return _("Linked files folder: ")
+                                        .. truncatePath(ZoteroAPI.getLinkedFilesBase())
+                                end,
+                                callback = function()
+                                    self:chooseDirectory(
+                                        "linked_files_base",
+                                        _("Choose linked files folder"),
+                                        function(path)
+                                            ZoteroAPI.setLinkedFilesBase(path)
+                                            ZoteroAPI.saveSettingsToFile()
+                                        end
+                                    )
+                                end,
+                            },
+                            {
+                                text = _("Enable external Zotero storage folder"),
+                                checked_func = function()
+                                    return ZoteroAPI.getExternalStorageEnabled()
+                                end,
+                                callback = function()
+                                    ZoteroAPI.toggleExternalStorageEnabled()
+                                    ZoteroAPI.saveSettingsToFile()
+                                end,
+                            },
+                            {
+                                text_func = function()
+                                    return _("External storage folder: ")
+                                        .. truncatePath(ZoteroAPI.getExternalStorageDir())
+                                end,
+                                callback = function()
+                                    self:chooseDirectory(
+                                        "external_storage_dir",
+                                        _("Choose Zotero storage folder"),
+                                        function(path)
+                                            ZoteroAPI.setExternalStorageDir(path)
+                                            ZoteroAPI.saveSettingsToFile()
+                                        end
+                                    )
+                                end,
+                            },
+                            {
+                                text = _("Prefer local files when available"),
+                                checked_func = function()
+                                    return ZoteroAPI.getSettings():readSetting("prefer_local_files", true)
+                                end,
+                                callback = function()
+                                    ZoteroAPI.getSettings():toggle("prefer_local_files")
+                                    ZoteroAPI.saveSettingsToFile()
+                                end,
+                            },
+                            {
+                                text = _("Allow opening outdated local files"),
+                                checked_func = function()
+                                    return ZoteroAPI.getAllowStaleLocal()
+                                end,
+                                callback = function()
+                                    ZoteroAPI.toggleAllowStaleLocal()
+                                    ZoteroAPI.saveSettingsToFile()
+                                end,
+                            },
+                            {
+                                text = _("Add search root folder"),
+                                callback = function()
+                                    self:chooseDirectory(
+                                        "search_root_pick",
+                                        _("Choose folder to search for files"),
+                                        function(path)
+                                            ZoteroAPI.addSearchRoot(path)
+                                            ZoteroAPI.saveSettingsToFile()
+                                        end
+                                    )
+                                end,
+                            },
+                            {
+                                text = _("View search root folders"),
+                                callback = function()
+                                    self:showSearchRoots()
+                                end,
+                            },
+                            {
+                                text = _("Preview local path resolution"),
+                                callback = function()
+                                    self:showLocalPathPreview()
+                                end,
+                            },
+                            {
+                                text = _("Add path mapping"),
+                                callback = function()
+                                    self:addPathMapping()
+                                end,
+                            },
+                            {
+                                text = _("Suggest path mapping from Zotero path"),
+                                callback = function()
+                                    self:suggestPathMapping()
+                                end,
+                            },
+                            {
+                                text = _("View path mappings"),
+                                callback = function()
+                                    self:showPathMappings()
+                                end,
+                            },
+                            {
+                                text = _("Clear all path mappings"),
+                                callback = function()
+                                    ZoteroAPI.clearPathMappings()
+                                    ZoteroAPI.saveSettingsToFile()
+                                    UIManager:show(InfoMessage:new({
+                                        text = _("Path mappings cleared."),
+                                        timeout = 3,
+                                        icon = "notice-info",
+                                    }))
+                                end,
+                            },
+                        },
                     },
                 },
             },
@@ -500,7 +787,7 @@ function Plugin:addToMainMenu(menu_items)
                 callback = function()
                     local version = ZoteroAPI.version
                     local stats = ZoteroAPI.getStats()
-                    local auto_disable_status = ZoteroAPI.getSettings():readSetting("auto_disable_pdf_writing", true)
+                    local write_pdf = (not ZoteroAPI.getSettings():readSetting("auto_disable_pdf_writing", false))
                         and "Enabled"
                         or "Disabled"
                     UIManager:show(InfoMessage:new({
@@ -521,8 +808,8 @@ function Plugin:addToMainMenu(menu_items)
                             .. stats.attachments
                             .. "\n\tAnnotations:\t"
                             .. stats.annotations
-                            .. "\n\nPDF Settings:\n\tAuto-disable PDF writing:\t"
-                            .. auto_disable_status
+                            .. "\n\nPDF Settings:\n\tWrite into PDF:\t"
+                            .. write_pdf
                             .. "\n"
                         ),
                         --timeout = 10,
@@ -533,7 +820,20 @@ function Plugin:addToMainMenu(menu_items)
                     return nil
                 end,
             },
-        },
+    }
+end
+
+function Plugin:addToMainMenu(menu_items)
+    local sub_menu = self:getZoteroSubMenu()
+    menu_items.zoteroatelier = {
+        text = _("Zotero Atelier"),
+        sorting_hint = "search",
+        sub_item_table = sub_menu,
+    }
+    menu_items.zoteroatelier_tools = {
+        text = _("Zotero Atelier"),
+        sorting_hint = "tools",
+        sub_item_table = sub_menu,
     }
 end
 
@@ -632,6 +932,286 @@ function Plugin:setWebdavAccount()
     })
     UIManager:show(self.webdav_account_dialog)
     self.webdav_account_dialog:onShowKeyboard()
+end
+
+function Plugin:chooseDirectory(setting_key, title, on_path_chosen)
+    local current = ZoteroAPI.getSettings():readSetting(setting_key, "") or ""
+    local start_dir = current
+    if start_dir == "" then
+        start_dir = Device.home_dir or "/"
+    end
+    local ok, PathChooser = pcall(require, "ui/widget/pathchooser")
+    if ok and PathChooser then
+        local path_chooser = PathChooser:new({
+            title = title,
+            path = start_dir,
+            select_directory = true,
+            select_file = false,
+            show_files = false,
+            onConfirm = function(dir)
+                on_path_chosen(dir)
+                ZoteroAPI.saveSettingsToFile()
+                self:showLocalPathPreview(dir)
+            end,
+        })
+        UIManager:show(path_chooser)
+        return
+    end
+    local input_dialog
+    input_dialog = InputDialog:new({
+        title = title,
+        input = current,
+        input_hint = _("Full path to folder"),
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    callback = function()
+                        UIManager:close(input_dialog)
+                    end,
+                },
+                {
+                    text = _("OK"),
+                    is_enter_default = true,
+                    callback = function()
+                        local path = input_dialog:getInputText()
+                        UIManager:close(input_dialog)
+                        if path and path ~= "" then
+                            on_path_chosen(path)
+                            ZoteroAPI.saveSettingsToFile()
+                            self:showLocalPathPreview(path)
+                        end
+                    end,
+                },
+            },
+        },
+    })
+    UIManager:show(input_dialog)
+    input_dialog:onShowKeyboard()
+end
+
+function Plugin:showLocalPathPreview(folder_hint)
+    local probe = ZoteroAPI.getFirstLocalPathPreview()
+    local text = ZoteroAPI.formatLocalPathPreview(probe)
+    if folder_hint and folder_hint ~= "" then
+        text = _("Folder set to:\n") .. folder_hint .. "\n\n" .. text
+    end
+    local preview_dialog
+    preview_dialog = ButtonDialog:new({
+        title = _("Local path preview") .. "\n\n" .. text,
+        title_align = "center",
+        buttons = {
+            {
+                {
+                    text = _("Close"),
+                    callback = function()
+                        UIManager:close(preview_dialog)
+                    end,
+                },
+                {
+                    text = _("Test again"),
+                    callback = function()
+                        UIManager:close(preview_dialog)
+                        self:showLocalPathPreview()
+                    end,
+                },
+            },
+        },
+    })
+    UIManager:show(preview_dialog)
+end
+
+function Plugin:addPathMapping()
+    self.path_mapping_dialog = MultiInputDialog:new({
+        title = _("Add path mapping"),
+        description = _("Map a path prefix from your PC to the same location on this device."),
+        fields = {
+            {
+                text = "",
+                hint = _("From (PC prefix), e.g. D:\\Zotero"),
+            },
+            {
+                text = "",
+                hint = _("To (device prefix), e.g. /storage/emulated/0/Sync/Zotero"),
+            },
+        },
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(self.path_mapping_dialog)
+                    end,
+                },
+                {
+                    text = _("Add"),
+                    callback = function()
+                        local fields = self.path_mapping_dialog:getFields()
+                        if fields[1] == "" or fields[2] == "" then
+                            UIManager:show(InfoMessage:new({
+                                text = _("Both path prefixes are required."),
+                                timeout = 3,
+                                icon = "notice-warning",
+                            }))
+                            return
+                        end
+                        ZoteroAPI.addPathMapping(fields[1], fields[2])
+                        ZoteroAPI.saveSettingsToFile()
+                        UIManager:close(self.path_mapping_dialog)
+                        self:showLocalPathPreview()
+                    end,
+                },
+            },
+        },
+    })
+    UIManager:show(self.path_mapping_dialog)
+    self.path_mapping_dialog:onShowKeyboard()
+end
+
+function Plugin:suggestPathMapping()
+    local dialog
+    dialog = MultiInputDialog:new({
+        title = _("Suggest path mapping"),
+        description = _("Paste a path as stored in Zotero, then choose the matching folder on this device."),
+        fields = {
+            {
+                text = "",
+                hint = _("Zotero path (from PC), e.g. D:\\Papers\\file.pdf"),
+            },
+            {
+                text = ZoteroAPI.getLinkedFilesBase() or "",
+                hint = _("Device folder containing the file"),
+            },
+        },
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+                {
+                    text = _("Create mapping"),
+                    is_enter_default = true,
+                    callback = function()
+                        local fields = dialog:getFields()
+                        local from_path = ZoteroAPI.normalizePath(fields[1] or "")
+                        local to_dir = ZoteroAPI.normalizePath(fields[2] or "")
+                        if from_path == "" or to_dir == "" then
+                            UIManager:show(InfoMessage:new({
+                                text = _("Both paths are required."),
+                                timeout = 3,
+                                icon = "notice-warning",
+                            }))
+                            return
+                        end
+                        local basename = ZoteroAPI.basenameOfPath(from_path)
+                        local from_prefix = from_path
+                        if basename and #basename < #from_path then
+                            from_prefix = from_path:sub(1, #from_path - #basename)
+                            if from_prefix:sub(-1) == "/" then
+                                from_prefix = from_prefix:sub(1, -2)
+                            end
+                        end
+                        ZoteroAPI.addPathMapping(from_prefix, to_dir)
+                        ZoteroAPI.saveSettingsToFile()
+                        UIManager:close(dialog)
+                        UIManager:show(InfoMessage:new({
+                            text = _("Mapping added:\n") .. from_prefix .. "\n→\n" .. to_dir,
+                            timeout = 4,
+                            icon = "notice-info",
+                        }))
+                        self:showLocalPathPreview()
+                    end,
+                },
+            },
+        },
+    })
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+function Plugin:showSearchRoots()
+    local roots = ZoteroAPI.getSearchRoots()
+    if #roots == 0 then
+        UIManager:show(InfoMessage:new({
+            text = _("No extra search roots configured."),
+            timeout = 3,
+            icon = "notice-info",
+        }))
+        return
+    end
+    local items = {}
+    for i, root in ipairs(roots) do
+        table.insert(items, {
+            text = truncatePath(root, 60),
+            index = i,
+            path = root,
+        })
+    end
+    local menu
+    menu = Menu:new({
+        title = _("Search root folders"),
+        item_table = items,
+        is_borderless = true,
+        is_popout = true,
+        onMenuHold = function(_, item)
+            ZoteroAPI.removeSearchRoot(item.index)
+            ZoteroAPI.saveSettingsToFile()
+            UIManager:close(menu)
+            UIManager:show(InfoMessage:new({
+                text = _("Search root removed."),
+                timeout = 2,
+            }))
+            return true
+        end,
+        close_callback = function()
+            UIManager:close(menu)
+        end,
+    })
+    UIManager:show(menu)
+end
+
+function Plugin:showPathMappings()
+    local mappings = ZoteroAPI.getPathMappings()
+    if #mappings == 0 then
+        UIManager:show(InfoMessage:new({
+            text = _("No path mappings configured."),
+            timeout = 3,
+            icon = "notice-info",
+        }))
+        return
+    end
+    local lines = {}
+    for i, m in ipairs(mappings) do
+        table.insert(lines, i .. ". " .. m.from .. "\n   → " .. m.to)
+    end
+    local remove_dialog
+    remove_dialog = ButtonDialog:new({
+        title = _("Path mappings") .. "\n\n" .. table.concat(lines, "\n\n"),
+        buttons = {
+            {
+                {
+                    text = _("Close"),
+                    callback = function()
+                        UIManager:close(remove_dialog)
+                    end,
+                },
+                {
+                    text = _("Remove last"),
+                    callback = function()
+                        ZoteroAPI.removePathMapping(#mappings)
+                        ZoteroAPI.saveSettingsToFile()
+                        UIManager:close(remove_dialog)
+                        self:showPathMappings()
+                    end,
+                },
+            },
+        },
+    })
+    UIManager:show(remove_dialog)
 end
 
 function Plugin:setItemsPerPage()

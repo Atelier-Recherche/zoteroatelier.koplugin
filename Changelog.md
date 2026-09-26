@@ -1,5 +1,19 @@
 # Change Log
 
+## Zotero Atelier 2.0 - 2026-09-18
+### Added
+- Project rename / branding: **Zotero Atelier** (`zoteroatelier.koplugin`)
+- Annotation create / **update** / delete sync with Zotero
+- Write highlights into PDF (toggle; enabled by default when opening from browser)
+- Document annotations panel + global annotation search
+- EPUB annotation sync (sidecar ↔ Zotero)
+- Expanded local file resolution (basename search, search roots, stale files, path mapping wizard)
+- French README (`README.md`) + English (`README.en.md`)
+
+### Changed
+- Annotation sync also on document open/close
+- Sync annotations resolves linked / external local paths (not only plugin cache)
+
 ## JD 0.5 - 2025-10-07
 ### Changed
 - Removed sqlite json functions in queries and moved them to be processed by Lua given latest version of KOReader does not include the JSON package

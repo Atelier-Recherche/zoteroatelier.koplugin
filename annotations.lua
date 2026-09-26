@@ -463,6 +463,146 @@ function Annotations.convertZoteroToKOReader(annotation, page_bbox)
     return koAnnotation
 end
 
+-- Detect whether a local KOReader annotation differs from the Zotero item data.
+function Annotations.annotationNeedsUpdate(local_ann, zotero_item)
+    if local_ann == nil or zotero_item == nil or zotero_item.data == nil then
+        return false
+    end
+    local data = zotero_item.data
+    local local_type = Annotations.annotationTypeKOReaderToZotero(local_ann.drawer)
+    if local_type and data.annotationType and local_type ~= data.annotationType then
+        return true
+    end
+    local local_color = defaultZColor
+    if local_ann.color ~= nil then
+        local_color = K2Z_COLORS[string.lower(local_ann.color)] or K2Z_COLORS["yellow"]
+    end
+    if data.annotationColor and string.lower(local_color) ~= string.lower(data.annotationColor) then
+        return true
+    end
+    local local_text = local_ann.text or ""
+    local remote_text = data.annotationText or ""
+    if local_text ~= remote_text then
+        return true
+    end
+    local local_note = local_ann.note or ""
+    local remote_note = data.annotationComment or ""
+    if local_note ~= remote_note then
+        return true
+    end
+    return false
+end
+
+-- Build a Zotero update payload (includes key + version) from a KOReader annotation.
+function Annotations.buildUpdatePayload(annotation, page_bbox, parent_key)
+    local payload = Annotations.convertKOReaderToZotero(annotation, page_bbox, parent_key)
+    payload.key = annotation.zoteroKey
+    payload.version = annotation.zoteroVersion
+    return payload
+end
+
+-- EPUB / non-PDF: build a Zotero annotation from KOReader sidecar fields without PDF rects.
+function Annotations.convertKOReaderToZoteroEpub(annotation, parent_key)
+    local date = Annotations.utcFromLocal(annotation.datetime or os.date("%Y-%m-%d %H:%M:%S"))
+    local color = defaultZColor
+    if annotation.color ~= nil then
+        color = K2Z_COLORS[string.lower(annotation.color)] or K2Z_COLORS["yellow"]
+    end
+    local ann_type = Annotations.annotationTypeKOReaderToZotero(annotation.drawer) or "highlight"
+    local page = annotation.pageno or annotation.page or 1
+    local position = {
+        pageIndex = math.max(0, (tonumber(page) or 1) - 1),
+        rects = {},
+    }
+    if annotation.pos0 and annotation.pos0.xpointer then
+        position.koreaderPos0 = annotation.pos0.xpointer
+    end
+    if annotation.pos1 and annotation.pos1.xpointer then
+        position.koreaderPos1 = annotation.pos1.xpointer
+    end
+    if annotation.zoteroAnnotationPosition then
+        local ok, parsed = pcall(JSON.decode, annotation.zoteroAnnotationPosition)
+        if ok and type(parsed) == "table" then
+            if parsed.pageIndex ~= nil then
+                position.pageIndex = parsed.pageIndex
+            end
+            if type(parsed.rects) == "table" and #parsed.rects > 0 then
+                position.rects = parsed.rects
+            end
+            if parsed.value then
+                position.value = parsed.value
+            end
+        end
+    end
+    local zoteroSortIndex = Annotations.makeSortIndex(tonumber(page) or 1, 0, 0)
+    local ZAnnotation = {
+        ["itemType"] = "annotation",
+        ["parentItem"] = parent_key,
+        ["annotationType"] = ann_type,
+        ["annotationColor"] = color,
+        ["annotationPageLabel"] = tostring(page),
+        ["annotationSortIndex"] = zoteroSortIndex,
+        ["annotationPosition"] = JSON.encode(position),
+        ["dateModified"] = date,
+    }
+    if annotation.note then
+        ZAnnotation["annotationComment"] = annotation.note
+    end
+    if annotation.text then
+        ZAnnotation["annotationText"] = annotation.text
+    end
+    return ZAnnotation
+end
+
+-- Convert Zotero EPUB (or non-PDF) annotation to KOReader sidecar fields.
+function Annotations.convertZoteroToKOReaderEpub(annotation)
+    local pos = {}
+    if annotation.data.annotationPosition then
+        local ok, parsed = pcall(JSON.decode, annotation.data.annotationPosition)
+        if ok and type(parsed) == "table" then
+            pos = parsed
+        end
+    end
+    local page = (pos.pageIndex or 0) + 1
+    local color_mapped = Z2K_COLORS[annotation.data.annotationColor] or defaultKColor
+    local drawer_mapped = Z2K_STYLE[annotation.data.annotationType] or "lighten"
+    local datetime_converted = string.sub(string.gsub(annotation.data.dateModified or "", "T", " "), 1, -2)
+    if datetime_converted == "" then
+        datetime_converted = os.date("%Y-%m-%d %H:%M:%S")
+    end
+    local koAnnotation = {
+        ["color"] = color_mapped,
+        ["datetime"] = datetime_converted,
+        ["drawer"] = drawer_mapped,
+        ["page"] = page,
+        ["pageno"] = page,
+        ["text"] = annotation.data.annotationText,
+        ["zoteroKey"] = annotation.key,
+        ["zoteroSortIndex"] = annotation.data.annotationSortIndex,
+        ["zoteroVersion"] = annotation.version,
+        ["zoteroAnnotationPosition"] = annotation.data.annotationPosition,
+    }
+    if pos.koreaderPos0 or pos.koreaderPos1 then
+        koAnnotation.pos0 = { xpointer = pos.koreaderPos0 }
+        koAnnotation.pos1 = { xpointer = pos.koreaderPos1 }
+    elseif pos.value and tostring(pos.value):match("^epubcfi") then
+        -- Keep CFI for round-trip; KOReader may still show text in bookmarks list
+        koAnnotation.zoteroCfi = pos.value
+    end
+    if annotation.data.annotationComment and annotation.data.annotationComment ~= "" then
+        koAnnotation["note"] = annotation.data.annotationComment
+    end
+    return koAnnotation
+end
+
+function Annotations.isPdfPath(file_path)
+    return file_path ~= nil and string.lower(file_path):match("%.pdf$") ~= nil
+end
+
+function Annotations.isEpubPath(file_path)
+    return file_path ~= nil and string.lower(file_path):match("%.epub$") ~= nil
+end
+
 -- Create annotations for a single document using creation_callback.
 -- returns number of items it FAILED to sync (and error if applicable)
 function Annotations.createAnnotations(file_path, key, creation_callback)
@@ -474,53 +614,62 @@ function Annotations.createAnnotations(file_path, key, creation_callback)
         or #doc_settings.data["annotations"] == 0
     then
         logger.info("Annotations.createAnnotations: No annotations to create")
-        return
+        return 0, nil
     end
 
     local k_annotations = doc_settings.data["annotations"]
     local z_annotations = {}
     local pages = {}
+    local is_pdf = Annotations.isPdfPath(file_path)
 
     -- the following associative array maps from indices of k_annotations to z_annotations.
     -- This is necessary because not all annotations necessitate a creation event, since some might
     -- have been created in a prevous sync.
     local index_map = {}
 
-    -- gather page numbers beforehand so that we may determine page sizes in a
-    -- single go
-    for i = 1, #k_annotations do
-        local pageno = k_annotations[i].pageno or
-            k_annotations[i]
-            .page -- not sure what is the difference between page and pageno
-        pages[pageno] = true
-    end
+    local page_dimensions = {}
+    if is_pdf then
+        -- gather page numbers beforehand so that we may determine page sizes in a
+        -- single go
+        for i = 1, #k_annotations do
+            local pageno = k_annotations[i].pageno or
+                k_annotations[i]
+                .page -- not sure what is the difference between page and pageno
+            pages[pageno] = true
+        end
 
-    logger.info("Annotations.createAnnotations: Getting BBOX dimensions for pages: " .. JSON.encode(pages))
-    local page_dimensions = Annotations.getPageDimensions(file_path, pages)
+        logger.info("Annotations.createAnnotations: Getting BBOX dimensions for pages: " .. JSON.encode(pages))
+        page_dimensions = Annotations.getPageDimensions(file_path, pages)
 
-    if page_dimensions == nil then
-        logger.err(
-            ("Zotero: Skipping '%s' because page dimensions can not be determined. relevant pages where %s"):format(
-                file_path,
-                JSON.encode(pages)
+        if page_dimensions == nil then
+            logger.err(
+                ("Zotero: Skipping '%s' because page dimensions can not be determined. relevant pages where %s"):format(
+                    file_path,
+                    JSON.encode(pages)
+                )
             )
-        )
-        return nil
+            return 1, "page dimensions unavailable"
+        end
     end
 
     logger.info("Annotations.createAnnotations: Processing " .. #k_annotations .. " annotations")
     for i = 1, #k_annotations do
         if (k_annotations[i].zoteroKey == nil) and (k_annotations[i].drawer ~= nil) then
-            -- at some point should figure out what to do with annotations where k_annotations[i].drawer == 0
-            local pageno = k_annotations[i].pageno
-            local page_bbox = page_dimensions[pageno]
-            if page_bbox == nil then
-                logger.err("Annotations.createAnnotations: No BBOX data for page " .. pageno .. ", skipping annotation")
+            local pageno = k_annotations[i].pageno or k_annotations[i].page
+            if is_pdf then
+                local page_bbox = page_dimensions[pageno]
+                if page_bbox == nil then
+                    logger.err("Annotations.createAnnotations: No BBOX data for page " .. tostring(pageno) .. ", skipping annotation")
+                else
+                    logger.info("Annotations.createAnnotations: Converting annotation " .. i .. " on page " .. tostring(pageno))
+                    local a = Annotations.convertKOReaderToZotero(k_annotations[i], page_bbox, key)
+                    table.insert(z_annotations, a)
+                    index_map[#z_annotations] = i
+                end
             else
-                logger.info("Annotations.createAnnotations: Converting annotation " .. i .. " on page " .. pageno)
-                local a = Annotations.convertKOReaderToZotero(k_annotations[i], page_bbox, key)
+                local a = Annotations.convertKOReaderToZoteroEpub(k_annotations[i], key)
                 table.insert(z_annotations, a)
-                index_map[#z_annotations] = i -- keep track of index
+                index_map[#z_annotations] = i
             end
         end
     end
@@ -556,6 +705,106 @@ function Annotations.createAnnotations(file_path, key, creation_callback)
     end
 
     return #z_annotations - cnt, nil
+end
+
+-- Update existing annotations that differ from Zotero.
+-- get_item_callback(key) -> zotero item; update_callback(payloads) -> updated items
+-- returns number of items it FAILED to sync (and error if applicable)
+function Annotations.updateAnnotations(file_path, key, update_callback, get_item_callback)
+    local doc_settings = DocSettings:open(file_path)
+    if
+        doc_settings.data == nil
+        or doc_settings.data["annotations"] == nil
+        or #doc_settings.data["annotations"] == 0
+    then
+        return 0, nil
+    end
+
+    local k_annotations = doc_settings.data["annotations"]
+    local z_updates = {}
+    local index_map = {}
+    local pages = {}
+    local is_pdf = Annotations.isPdfPath(file_path)
+
+    for i = 1, #k_annotations do
+        local ann = k_annotations[i]
+        if ann.zoteroKey ~= nil and ann.drawer ~= nil then
+            local remote = nil
+            if get_item_callback then
+                remote = get_item_callback(ann.zoteroKey)
+            end
+            if remote and Annotations.annotationNeedsUpdate(ann, remote) then
+                local pageno = ann.pageno or ann.page
+                if is_pdf and pageno then
+                    pages[pageno] = true
+                end
+                table.insert(z_updates, { index = i, ann = ann, remote = remote })
+            end
+        end
+    end
+
+    if #z_updates == 0 then
+        return 0, nil
+    end
+
+    local page_dimensions = {}
+    if is_pdf then
+        page_dimensions = Annotations.getPageDimensions(file_path, pages)
+        if page_dimensions == nil then
+            return #z_updates, "Could not get page dimensions for update"
+        end
+    end
+
+    local payloads = {}
+    for _, entry in ipairs(z_updates) do
+        local ann = entry.ann
+        local payload
+        if is_pdf then
+            local pageno = ann.pageno or ann.page
+            local page_bbox = page_dimensions[pageno]
+            if page_bbox == nil then
+                logger.err("Annotations.updateAnnotations: No BBOX for page " .. tostring(pageno))
+            else
+                payload = Annotations.buildUpdatePayload(ann, page_bbox, key)
+            end
+        else
+            payload = Annotations.convertKOReaderToZoteroEpub(ann, key)
+            payload.key = ann.zoteroKey
+            payload.version = ann.zoteroVersion or (entry.remote and entry.remote.version)
+        end
+        if payload then
+            table.insert(payloads, payload)
+            index_map[#payloads] = entry.index
+        end
+    end
+
+    if #payloads == 0 then
+        return 0, nil
+    end
+
+    local updated_items, e = update_callback(payloads)
+    if updated_items == nil then
+        return #payloads, e
+    end
+
+    local cnt = 0
+    for k, v in pairs(updated_items) do
+        if v and (v.key ~= nil or v.version ~= nil) then
+            local k_index = index_map[k]
+            if k_index then
+                if v.version then
+                    k_annotations[k_index].zoteroVersion = v.version
+                end
+                cnt = cnt + 1
+            end
+        end
+    end
+
+    if cnt > 0 then
+        doc_settings:flush()
+    end
+
+    return #payloads - cnt, nil
 end
 
 return Annotations

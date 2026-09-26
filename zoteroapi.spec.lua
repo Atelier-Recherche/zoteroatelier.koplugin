@@ -5,7 +5,7 @@ describe("Zotero API Client", function()
     assert.truthy(API_KEY)
     assert.truthy(USER_ID)
 
-    package.path = "plugins/zotero.koplugin/?.lua;" .. package.path
+    package.path = "plugins/zoteroatelier.koplugin/?.lua;" .. package.path
     require("commonrequire")
     local JSON = require("json")
     local ZoteroAPI = require("zoteroapi")
