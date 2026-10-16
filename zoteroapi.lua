@@ -1536,18 +1536,21 @@ function API.checkZoteroKey(page_url)
     logger.info("Zotero: API key OK for user " .. tostring(result.username) .. " (" .. tostring(result.userID) .. ")")
     logger.dbg("Zotero: Access: " .. JSON.encode(result.access))
 
+    -- Persist library owner info with bound parameters (never interpolate strings into SQL).
     local db = API.openDB()
-    local sql = "SELECT userID FROM libraries WHERE libraryID=1;"
-    local uID = db:rowexec(sql)
-    if uID == 0 or uID == nil or tonumber(uID) == 0 then
-        local uname = tostring(result.username or ""):gsub('"', "")
-        sql = ('UPDATE libraries SET userID=%i, name="%s", editable=%i WHERE libraryID=1;'):format(
-            tonumber(result.userID) or 0,
-            uname,
-            0
+    local uid = tonumber(result.userID) or 0
+    local uname = tostring(result.username or "")
+    local ok_upd, upd_err = pcall(function()
+        local stmt = db:prepare(
+            "UPDATE libraries SET userID = ?1, name = ?2, editable = 0 WHERE libraryID = 1;"
         )
-        db:rowexec(sql)
+        stmt:reset():bind(uid, uname):step()
+        stmt:close()
+    end)
+    if not ok_upd then
+        logger.err("Zotero: failed to update libraries row: ", upd_err)
     end
+
     API.access = result.access
     return API.access, result
 end
