@@ -1,13 +1,18 @@
 local _ = require("gettext")
 
 return {
-    -- Install folder must be zoteroatelier.koplugin; name must match.
-    name = "zoteroatelier",
+    -- Plugin id = folder name (zoteroatelier.koplugin → zoteroatelier).
+    -- Do not rely on a "name" field here (deprecated in recent KOReader).
     fullname = _("Zotero Atelier"),
     description = _([[
-Accès rapide à votre bibliothèque Zotero (parcours, sync, annotations PDF/EPUB, fichiers locaux).
+Bibliothèque Zotero dans KOReader : parcours, sync, annotations PDF/EPUB, fichiers locaux.
 
-Menu : barre du haut → Recherche (loupe) ou Outils → Zotero Atelier.
-Liste des plugins : Réglages → Plugin management → User plugins → Zotero Atelier.
-Redémarrez KOReader après l’installation.]]),
+Où le trouver :
+• Menu du haut → Recherche (loupe) → Zotero Atelier
+• Menu du haut → Outils → Zotero Atelier
+• Menu du haut → Réglages (roue) → Zotero Atelier
+• Activer : Réglages → Plugin management → User plugins → Zotero Atelier
+
+Dossier obligatoire : zoteroatelier.koplugin (avec main.lua et _meta.lua directement dedans).
+Redémarrage complet de KOReader après installation.]]),
 }

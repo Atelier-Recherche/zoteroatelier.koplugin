@@ -15,8 +15,6 @@ local Geom = require("ui/geometry")
 local _ = require("gettext")
 local ZoteroAPI = require("zoteroapi")
 local itemInfoViewer = require("zoteroiteminfo")
-local AnnotationPanel = require("annotation_panel")
-local AnnotationSearch = require("annotation_search")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
 local ButtonDialog = require("ui/widget/buttondialog")
 local lfs = require("libs/libkoreader-lfs")
@@ -24,6 +22,25 @@ local logger = require("logger")
 local NetworkMgr = require("ui/network/manager")
 local DocSettings = require("docsettings")
 local Trapper = require("frontend/ui/trapper")
+
+-- Lazy-load optional UI modules so a missing file cannot prevent the whole plugin from loading.
+local function getAnnotationPanel()
+    local ok, mod = pcall(require, "annotation_panel")
+    if ok then
+        return mod
+    end
+    logger.err("Zotero Atelier: annotation_panel.lua failed to load: ", mod)
+    return nil
+end
+
+local function getAnnotationSearch()
+    local ok, mod = pcall(require, "annotation_search")
+    if ok then
+        return mod
+    end
+    logger.err("Zotero Atelier: annotation_search.lua failed to load: ", mod)
+    return nil
+end
 
 local DEFAULT_LINES_PER_PAGE = 14
 
@@ -451,7 +468,11 @@ function Plugin:init()
     -- re-initialised every time.
     -- But at least the ZoteroAPI only needs to be initialised once
     self:onDispatcherRegisterActions()
-    self.ui.menu:registerToMainMenu(self)
+    if self.ui and self.ui.menu and self.ui.menu.registerToMainMenu then
+        self.ui.menu:registerToMainMenu(self)
+    else
+        logger.err("Zotero Atelier: ui.menu unavailable; plugin menu will not appear")
+    end
     if not init_done then
         xpcall(self.initAPI, self.initError, self)
         init_done = true
@@ -459,11 +480,11 @@ function Plugin:init()
     xpcall(self.initBrowser, self.initError, self)
     self.initialized = init_done
 
-    logger.dbg("Zotero: successfully initialized!")
+    logger.info("Zotero Atelier: initialized (ok=" .. tostring(self.initialized) .. ")")
 end
 
 function Plugin:initError(e)
-    logger.err("Zotero: Could not initialize Zotero: " .. e)
+    logger.err("Zotero Atelier: Could not initialize: " .. tostring(e))
 end
 
 function Plugin:checkInitialized()
@@ -530,13 +551,31 @@ function Plugin:getZoteroSubMenu()
                     return self.ui ~= nil and self.ui.document ~= nil
                 end,
                 callback = function()
-                    AnnotationPanel.show(self.ui)
+                    local panel = getAnnotationPanel()
+                    if panel then
+                        panel.show(self.ui)
+                    else
+                        UIManager:show(InfoMessage:new({
+                            text = _("Annotation panel module missing. Reinstall the plugin files."),
+                            timeout = 4,
+                            icon = "notice-warning",
+                        }))
+                    end
                 end,
             },
             {
                 text = _("Search annotations"),
                 callback = function()
-                    AnnotationSearch.show(self)
+                    local search = getAnnotationSearch()
+                    if search then
+                        search.show(self)
+                    else
+                        UIManager:show(InfoMessage:new({
+                            text = _("Annotation search module missing. Reinstall the plugin files."),
+                            timeout = 4,
+                            icon = "notice-warning",
+                        }))
+                    end
                 end,
             },
             {
@@ -825,6 +864,7 @@ end
 
 function Plugin:addToMainMenu(menu_items)
     local sub_menu = self:getZoteroSubMenu()
+    -- Appear in Search, Tools, AND Settings so the plugin is easy to find.
     menu_items.zoteroatelier = {
         text = _("Zotero Atelier"),
         sorting_hint = "search",
@@ -833,6 +873,11 @@ function Plugin:addToMainMenu(menu_items)
     menu_items.zoteroatelier_tools = {
         text = _("Zotero Atelier"),
         sorting_hint = "tools",
+        sub_item_table = sub_menu,
+    }
+    menu_items.zoteroatelier_settings = {
+        text = _("Zotero Atelier"),
+        sorting_hint = "setting",
         sub_item_table = sub_menu,
     }
 end

@@ -31,26 +31,40 @@ English version: [README.en.md](README.en.md)
 
 1. Utilisez une version récente de KOReader
 2. Copiez le dossier du plugin (voir ci-dessous — **le nom doit finir par `.koplugin`**)
-3. **Quittez complètement puis relancez** KOReader
+3. **Quittez complètement puis relancez** KOReader (pas seulement « retour »)
 4. Créez une clé API dans les [réglages Zotero](https://www.zotero.org/settings/keys) (notez le userID et la clé)
 5. Si besoin, configurez WebDAV (voir plus bas)
 6. Saisissez vos identifiants dans le menu du plugin, ou éditez le fichier de config
 
 ### Où copier le plugin
 
-Le dossier **doit** s’appeler exactement `zoteroatelier.koplugin`.
+Le dossier **doit** s’appeler exactement `zoteroatelier.koplugin`  
+(pas `zotero.koplugin`, pas `zoteroatelier.koplugin-master`, pas un dossier imbriqué).
 
-Il doit contenir au minimum `main.lua` et `_meta.lua` :
+> [!IMPORTANT]
+> Un ZIP GitHub s’appelle souvent `zoteroatelier.koplugin-master`.  
+> **Renommez-le** en `zoteroatelier.koplugin` après extraction.  
+> KOReader ignore tout dossier qui ne se termine pas exactement par `.koplugin`.
+
+Il doit contenir **directement** (pas un sous-dossier) :
 
 ```
-zoteroatelier.koplugin/
-├── _meta.lua
-├── main.lua
+…/plugins/zoteroatelier.koplugin/
+├── _meta.lua          ← obligatoire
+├── main.lua           ← obligatoire
 ├── zoteroapi.lua
 ├── annotations.lua
 ├── annotation_panel.lua
 ├── annotation_search.lua
+├── zoteroiteminfo.lua
 └── …
+```
+
+**Mauvais** (ne charge pas) :
+```
+plugins/zoteroatelier.koplugin/zoteroatelier.koplugin-master/main.lua
+plugins/zoteroatelier.koplugin-master/
+plugins/zotero.koplugin/   ← ancien nom, ce fork utilise zoteroatelier
 ```
 
 | Plateforme | Chemin typique |
@@ -59,26 +73,27 @@ zoteroatelier.koplugin/
 | **Android** | `/sdcard/koreader/plugins/zoteroatelier.koplugin` |
 | Alternative | `<répertoire data KOReader>/plugins/zoteroatelier.koplugin` |
 
-Sur Android, le dossier dans l’APK est souvent **non accessible en écriture** — préférez `/sdcard/koreader/plugins/`.
+Sur Android, préférez `/sdcard/koreader/plugins/` (l’APK est souvent en lecture seule).
 
-Si vous migrez depuis l’ancien `zotero.koplugin`, renommez le dossier (ou remplacez-le), puis redémarrez. Les données locales restent dans `<data KOReader>/zotero/` (inchangé pour compatibilité).
+Les données restent dans `<data KOReader>/zotero/` (compatibilité avec l’ancien plugin).
 
 ### Où trouver le plugin dans KOReader
 
-Ce plugin **n’apparaît pas** sous le menu Réglages (roue dentée) pour l’usage courant.
+Après un redémarrage complet :
 
-- **Utilisation :** menu du haut → **Recherche** (loupe) → **Zotero Atelier**, ou **Outils** → **Zotero Atelier**
-- **Fichiers locaux / mappings :** Zotero Atelier → **Settings** → **Local files**
-- **Activer / désactiver :** Réglages → **Plugin management** → **User plugins** → **Zotero Atelier**
+1. Menu du haut → **Recherche** (loupe) → **Zotero Atelier**
+2. Menu du haut → **Outils** → **Zotero Atelier**
+3. Menu du haut → **Réglages** (roue dentée) → **Zotero Atelier**
+4. Pour l’activer : Réglages → **Plugin management** → **User plugins** → cochez **Zotero Atelier** → redémarrer
 
-### Le plugin n’apparaît pas ?
+### Le plugin n’apparaît nulle part ?
 
-1. Vérifiez que le dossier se termine par `.koplugin`
-2. Vérifiez que `main.lua` et `_meta.lua` sont *dans* ce dossier
-3. Redémarrez KOReader complètement
-4. Contrôlez **Plugin management → User plugins**
-5. Sur Android : `/sdcard/koreader/plugins/zoteroatelier.koplugin`
-6. Sinon, cherchez `zotero` / `zoteroatelier` dans `crash.log`
+1. Dossier = exactement `zoteroatelier.koplugin` (voir ci-dessus)
+2. `main.lua` et `_meta.lua` sont **à la racine** de ce dossier
+3. Redémarrage **complet** de KOReader
+4. **Plugin management → User plugins** : case cochée (si « Zotero » ancien est désactivé, ce n’est pas le même plugin)
+5. Android : `/sdcard/koreader/plugins/zoteroatelier.koplugin`
+6. Ouvrez `crash.log` (répertoire data KOReader) et cherchez `zoteroatelier` / `Error when loading`
 
 ## Utilisation
 
