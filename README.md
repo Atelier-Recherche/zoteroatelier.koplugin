@@ -137,15 +137,26 @@ La sync des annotations se déclenche aussi à l’ouverture et à la fermeture 
 - **Re-scan storage** : indexe les fichiers déjà présents localement
 - **Resync entire collection** : remet la base locale à zéro puis resync complète (dernier recours)
 
-### Settings — Local files
+### Settings — Local files (chemins Windows → Android)
 
-Utile quand les PDF ne sont **pas** sur le stockage Zotero / WebDAV :
+Zotero sur PC enregistre souvent `D:\Notes\fichier.pdf`.  
+Sur Android ce chemin **n’existe pas**. Il faut :
 
-- Dossier **linked files** (fichiers liés Zotero)
-- Dossier **external Zotero storage** (`storage/KEY/fichier`)
-- **Prefer local files** / **Allow outdated local files**
-- **Search root folders** + recherche par nom de fichier
-- **Path mappings** (préfixe PC → préfixe liseuse) et assistant **Suggest path mapping**
+1. **Linked files folder** = le dossier **sur l’appareil**, ex.  
+   `/storage/emulated/0/Documents/Notes`  
+   (pas `D:\Notes` ; un raccourci `/Documents/Notes` est élargi si possible)
+2. **Path mapping** :  
+   - From : `D:\Notes`  
+   - To : `/storage/emulated/0/Documents/Notes`
+3. Activer **Enable linked files folder**
+4. Menu d’aide : **Help: Windows path → Android**
+
+Autres options : external Zotero storage, search roots, allow outdated local files.
+
+### Vérifier la clé API
+
+Menu → **Test Zotero API key** (ou **Save & test** après saisie du compte).  
+Le User ID est le **nombre** affiché sur https://www.zotero.org/settings/keys — pas le nom d’utilisateur.
 
 ### About/Info
 

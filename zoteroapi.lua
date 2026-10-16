@@ -22,7 +22,7 @@ local DocSettings = require("docsettings")
 -- /storage/<KEY>/version: Version number of downloaded attachment
 -- /meta.lua: Metadata containing library version, items etc.
 
-local API = { ["version"] = "Zotero Atelier 2.0" }
+local API = { ["version"] = "Zotero Atelier 2.0.1" }
 
 local SUPPORTED_MEDIA_TYPES = {
     [1] = "application/pdf",
@@ -31,6 +31,11 @@ local SUPPORTED_MEDIA_TYPES = {
 }
 
 local ZOTERO_BASE_URL = "https://api.zotero.org"
+-- Avoid infinite "Synchronizing…" on slow/broken networks (seconds).
+local HTTP_TIMEOUT = 45
+pcall(function()
+    https.TIMEOUT = HTTP_TIMEOUT
+end)
 
 -- Update whenever the database scheme is updated/changed
 local db_version = 1
@@ -713,7 +718,7 @@ function API.getLinkedFilesBase()
 end
 
 function API.setLinkedFilesBase(path)
-    API.settings:saveSetting("linked_files_base", path or "")
+    API.settings:saveSetting("linked_files_base", API.normalizeDevicePath(path or ""))
 end
 
 function API.getExternalStorageEnabled()
@@ -729,7 +734,7 @@ function API.getExternalStorageDir()
 end
 
 function API.setExternalStorageDir(path)
-    API.settings:saveSetting("external_storage_dir", path or "")
+    API.settings:saveSetting("external_storage_dir", API.normalizeDevicePath(path or ""))
 end
 
 function API.getPathMappings()
@@ -780,6 +785,7 @@ function API.addSearchRoot(path)
     if path == nil or path == "" then
         return
     end
+    path = API.normalizeDevicePath(path)
     local roots = API.getSearchRoots()
     for _, r in ipairs(roots) do
         if API.pathsEqual(r, path) then
@@ -1502,6 +1508,7 @@ function API.getZoteroData(page_url)
         url = page_url,
         headers = headers,
         sink = ltn12.sink.table(page_data),
+        timeout = HTTP_TIMEOUT,
     })
     local e = API.verifyResponse(r, c)
     if e ~= nil then
@@ -1517,41 +1524,44 @@ function API.getZoteroData(page_url)
     end
 end
 
--- Check the access provided by the Zotero API key
--- If needed, update info about library
-function API.checkZoteroKey(page_url, headers)
-    if API.access == nil then
-        local result, e = API.getZoteroData(page_url)
-        if result ~= nil then
-            logger.dbg("Zotero: Access: " .. JSON.encode(result.access))
-            --logger.info(header)
-            local db = API.openDB()
-            local sql = "SELECT userID FROM libraries WHERE libraryID=1;"
-            local uID = db:rowexec(sql)
-            if uID == 0 then
-                -- userID has not been set yet. Should only happed for first ever sync...
-                sql = ('UPDATE libraries SET userID=%i, name="%s", editable=%i WHERE libraryID=1;'):format(
-                    result.userID,
-                    result.username,
-                    0
-                )
-                db:rowexec(sql)
-            else
-                -- should check that it is still the same user library and that we have sufficient access...
-            end
-            API.access = result.access
-        else
-            return nil, "Zotero API key check: " .. e
-        end
+-- Check the access provided by the Zotero API key (/keys/current).
+function API.checkZoteroKey(page_url)
+    local result, e = API.getZoteroData(page_url)
+    if result == nil then
+        return nil, "Zotero API key check: " .. tostring(e)
     end
-    return API.access
+    if result.access == nil then
+        return nil, "Zotero API key check: unexpected response (no access field)"
+    end
+    logger.info("Zotero: API key OK for user " .. tostring(result.username) .. " (" .. tostring(result.userID) .. ")")
+    logger.dbg("Zotero: Access: " .. JSON.encode(result.access))
+
+    local db = API.openDB()
+    local sql = "SELECT userID FROM libraries WHERE libraryID=1;"
+    local uID = db:rowexec(sql)
+    if uID == 0 or uID == nil or tonumber(uID) == 0 then
+        local uname = tostring(result.username or ""):gsub('"', "")
+        sql = ('UPDATE libraries SET userID=%i, name="%s", editable=%i WHERE libraryID=1;'):format(
+            tonumber(result.userID) or 0,
+            uname,
+            0
+        )
+        db:rowexec(sql)
+    end
+    API.access = result.access
+    return API.access, result
 end
 
 function API.verifyResponse(r, c)
     if r ~= 1 then
-        return ("Error: " .. c)
+        if c == nil or c == "timeout" or c == "wantread" or c == "closed" then
+            return "Error: network timeout or connection failed (check Wi‑Fi / API key)"
+        end
+        return ("Error: " .. tostring(c))
+    elseif c == 0 then
+        return "Error: network timeout or connection failed (status 0)"
     elseif c ~= 200 then
-        return ("Error: API responded with status code " .. c)
+        return ("Error: API responded with status code " .. tostring(c))
     end
 
     return nil
@@ -1563,11 +1573,31 @@ function API.fetchCollectionSize(collection_url, headers)
         method = "HEAD",
         url = collection_url,
         headers = headers,
+        timeout = HTTP_TIMEOUT,
     })
 
     local e = API.verifyResponse(r, c)
     if e ~= nil then
-        return nil, e
+        -- Some proxies break HEAD; fall back to a tiny GET
+        logger.warn("Zotero: HEAD failed (" .. tostring(e) .. "), falling back to GET limit=1")
+        local get_url = collection_url
+        if get_url:find("?", 1, true) then
+            get_url = get_url .. "&limit=1"
+        else
+            get_url = get_url .. "?limit=1"
+        end
+        local page_data = {}
+        r, c, h = https.request({
+            method = "GET",
+            url = get_url,
+            headers = headers,
+            sink = ltn12.sink.table(page_data),
+            timeout = HTTP_TIMEOUT,
+        })
+        e = API.verifyResponse(r, c)
+        if e ~= nil then
+            return nil, e
+        end
     end
 
     local total_results = tonumber(h["total-results"])
@@ -1630,33 +1660,114 @@ end
 
 -- Verify that we can access Zotero API
 function API.verifyZoteroAccess()
-    if API.zoteroAcessVerified then
-        -- nothing to do here
-    else
-        local user_id = API.settings:readSetting("user_id", "")
-        local api_key = API.settings:readSetting("api_key", "")
+    if API.zoteroAcessVerified and API.zoteroHeader and API.userLibraryURL and API.access then
+        return nil
+    end
 
-        if user_id == "" then
-            return "Error: must set User ID"
-        elseif api_key == "" then
-            return "Error: must set API Key"
-        end
-        API.zoteroAcessVerified = true
-        -- generate the headers we will need
-        API.zoteroHeader = {
-            ["zotero-api-key"] = api_key,
-            ["zotero-api-version"] = "3",
-        }
-        -- generate the user library base URL
-        API.userLibraryURL = ZOTERO_BASE_URL .. ("/users/%s"):format(user_id)
-        -- check access of API key
-        local key_url = API.userLibraryURL .. "/keys/current"
-        local access, e = API.checkZoteroKey(key_url, headers)
-        if access == nil then
-            return e
+    local user_id = tostring(API.settings:readSetting("user_id", "") or "")
+    local api_key = tostring(API.settings:readSetting("api_key", "") or "")
+
+    if user_id == "" then
+        return "Error: must set User ID (numeric, from https://www.zotero.org/settings/keys )"
+    elseif api_key == "" then
+        return "Error: must set API Key"
+    end
+
+    API.zoteroHeader = {
+        ["zotero-api-key"] = api_key,
+        ["Zotero-API-Key"] = api_key,
+        ["zotero-api-version"] = "3",
+        ["Zotero-API-Version"] = "3",
+    }
+    API.userLibraryURL = ZOTERO_BASE_URL .. ("/users/%s"):format(user_id)
+    -- Correct endpoint is /keys/current (not under /users/{id}/…)
+    local key_url = ZOTERO_BASE_URL .. "/keys/current"
+    local access, key_info_or_err = API.checkZoteroKey(key_url)
+    if access == nil then
+        API.zoteroAcessVerified = false
+        API.access = nil
+        return key_info_or_err
+    end
+
+    -- Warn if configured user_id does not match the key owner
+    if type(key_info_or_err) == "table" and key_info_or_err.userID then
+        local key_uid = tostring(key_info_or_err.userID)
+        if key_uid ~= user_id then
+            logger.warn(
+                "Zotero: configured user_id="
+                    .. user_id
+                    .. " but API key belongs to userID="
+                    .. key_uid
+            )
+            return (
+                "Error: User ID mismatch. Your API key belongs to user "
+                .. key_uid
+                .. " ("
+                .. tostring(key_info_or_err.username or "?")
+                .. "), but you entered "
+                .. user_id
+                .. ". Fix User ID in Settings."
+            )
         end
     end
+
+    API.zoteroAcessVerified = true
     return nil
+end
+
+-- Test credentials and return a human-readable status string (nil error = ok message).
+-- Returns ok_message, err_message (one of them is nil).
+function API.testCredentials()
+    API.zoteroAcessVerified = false
+    API.access = nil
+    local e = API.verifyZoteroAccess()
+    if e ~= nil then
+        return nil, e
+    end
+    local user_id = tostring(API.getUserID() or "")
+    local write = API.access and API.access.user and API.access.user.write
+    local notes = API.access and API.access.user and API.access.user.notes
+    local files = API.access and API.access.user and API.access.user.files
+    local msg = _(
+        "API key recognized.\n"
+            .. "User ID: "
+            .. user_id
+            .. "\n"
+            .. "Library: "
+            .. tostring(files and "files OK" or "no files")
+            .. ", "
+            .. tostring(notes and "notes OK" or "no notes")
+            .. ", "
+            .. tostring(write and "write OK" or "read-only")
+    )
+    return msg, nil
+end
+
+-- Expand short Android paths like /Documents/... to a real absolute path.
+function API.normalizeDevicePath(p)
+    if p == nil or p == "" then
+        return p
+    end
+    p = API.normalizePath(p)
+    -- Common Android shortcuts (relative to internal storage)
+    if p:match("^/Documents") or p:match("^/Download") or p:match("^/Books") or p:match("^/Notes") then
+        local expanded = "/storage/emulated/0" .. p
+        if file_exists(expanded) then
+            return expanded
+        end
+        local sd = "/sdcard" .. p
+        if file_exists(sd) then
+            return API.normalizePath(sd)
+        end
+        return expanded
+    end
+    if p:match("^/sdcard/") then
+        local alt = p:gsub("^/sdcard", "/storage/emulated/0")
+        if file_exists(alt) then
+            return alt
+        end
+    end
+    return p
 end
 
 function API.getHeaders(api_key)
@@ -1953,17 +2064,20 @@ function API.syncAllItems(progress_callback)
     local since = API.getUserLibraryVersion()
     --logger.info("Local Zotero lib version: "..since)
 
+    callback(_("Checking Zotero API key…"))
     -- verify access
     local e = API.verifyZoteroAccess()
     if e ~= nil then
         return e
     end
+    callback(_("API key OK. Syncing library…"))
 
     local err
     if since > 0 then
         -- try to sync back first, so that any changes will be recorded when we update the db later on
-        if API.access.user.write and API.access.user.notes then
-            local upload_fails, delete_fails = API.syncAnnotations()
+        if API.access and API.access.user and API.access.user.write and API.access.user.notes then
+            callback(_("Uploading local annotations…"))
+            local upload_fails, delete_fails = API.syncAnnotations(callback)
             sync_stats.annotation_upload_fails = upload_fails or 0
             sync_stats.annotation_delete_fails = delete_fails or 0
         else
@@ -2613,6 +2727,7 @@ function API.syncAnnotations(progress_callback)
         Annotations.setDefaultColor(defaultColor)
         for i = 1, item_count do
             local key = files[1][i]
+            local db_ts = tonumber(files[3][i]) or 0
             local item = API.getItem(key)
             local file_path = nil
             if item then
@@ -2623,10 +2738,23 @@ function API.syncAnnotations(progress_callback)
                 end
             end
             if file_path and file_exists(file_path) then
-                local upload_fails, delete_fails, update_fails = API.syncAnnotationsForAttachment(key, file_path)
-                total_upload_fails = total_upload_fails + (upload_fails or 0)
-                total_delete_fails = total_delete_fails + (delete_fails or 0)
-                total_update_fails = total_update_fails + (update_fails or 0)
+                -- Only touch attachments whose sidecar changed since last annotation sync
+                local sidecarFile = nil
+                pcall(function()
+                    sidecarFile = DocSettings:findSidecarFile(file_path)
+                end)
+                local needs_sync = false
+                if sidecarFile then
+                    local file_ts = lfs.attributes(sidecarFile, "modification") or 0
+                    needs_sync = file_ts > db_ts
+                end
+                if needs_sync then
+                    local upload_fails, delete_fails, update_fails =
+                        API.syncAnnotationsForAttachment(key, file_path)
+                    total_upload_fails = total_upload_fails + (upload_fails or 0)
+                    total_delete_fails = total_delete_fails + (delete_fails or 0)
+                    total_update_fails = total_update_fails + (update_fails or 0)
+                end
             end
 
             if progress_callback ~= nil and (i == 1 or i % 10 == 0 or i == item_count) then

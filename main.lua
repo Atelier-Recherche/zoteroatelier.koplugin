@@ -627,6 +627,12 @@ function Plugin:getZoteroSubMenu()
                         end,
                     },
                     {
+                        text = _("Test Zotero API key"),
+                        callback = function()
+                            self:testZoteroAccount()
+                        end,
+                    },
+                    {
                         text = _("Enable WebDAV storage"),
                         checked_func = function()
                             return ZoteroAPI.getWebDAVEnabled()
@@ -708,12 +714,19 @@ function Plugin:getZoteroSubMenu()
                                 callback = function()
                                     self:chooseDirectory(
                                         "linked_files_base",
-                                        _("Choose linked files folder"),
+                                        _("Choose folder on THIS device (Android path)"),
                                         function(path)
                                             ZoteroAPI.setLinkedFilesBase(path)
                                             ZoteroAPI.saveSettingsToFile()
+                                            self:showLocalFilesHelp(path)
                                         end
                                     )
+                                end,
+                            },
+                            {
+                                text = _("Help: Windows path → Android"),
+                                callback = function()
+                                    self:showLocalFilesHelp()
                                 end,
                             },
                             {
@@ -885,13 +898,16 @@ end
 function Plugin:setAccount()
     self.account_dialog = MultiInputDialog:new({
         title = _("Edit User Info"),
+        description = _(
+            "On https://www.zotero.org/settings/keys : copy the numeric User ID and create an API key (library + notes + write if you sync annotations)."
+        ),
         fields = {
             {
-                text = ZoteroAPI.getUserID(),
-                hint = _("User ID (integer)"),
+                text = ZoteroAPI.getUserID() or "",
+                hint = _("User ID (digits only, not your username)"),
             },
             {
-                text = ZoteroAPI.getAPIKey(),
+                text = ZoteroAPI.getAPIKey() or "",
                 hint = _("API Key"),
             },
         },
@@ -906,13 +922,13 @@ function Plugin:setAccount()
                     end,
                 },
                 {
-                    text = _("Update"),
+                    text = _("Save & test"),
                     callback = function()
                         local fields = self.account_dialog:getFields()
-                        if not string.match(fields[1], "[0-9]+") then
+                        if not string.match(fields[1] or "", "^[0-9]+$") then
                             UIManager:show(InfoMessage:new({
-                                text = _("The User ID must be an integer number."),
-                                timeout = 3,
+                                text = _("The User ID must be an integer number (see zotero.org/settings/keys)."),
+                                timeout = 4,
                                 icon = "notice-warning",
                             }))
                             return
@@ -923,6 +939,7 @@ function Plugin:setAccount()
                         ZoteroAPI.saveSettingsToFile()
                         self.account_dialog:onClose()
                         UIManager:close(self.account_dialog)
+                        self:testZoteroAccount()
                     end,
                 },
             },
@@ -930,6 +947,50 @@ function Plugin:setAccount()
     })
     UIManager:show(self.account_dialog)
     self.account_dialog:onShowKeyboard()
+end
+
+function Plugin:testZoteroAccount()
+    if not self:checkInitialized() then
+        return
+    end
+    NetworkMgr:runWhenOnline(function()
+        Trapper:wrap(function()
+            Trapper:info(_("Testing Zotero API key…"))
+            local ok_msg, err = ZoteroAPI.testCredentials()
+            if err then
+                Trapper:info(err)
+            else
+                Trapper:info(ok_msg or _("API key OK."))
+            end
+        end)
+    end)
+end
+
+function Plugin:showLocalFilesHelp(chosen_path)
+    local device_path = chosen_path or ZoteroAPI.getLinkedFilesBase() or ""
+    if device_path ~= "" then
+        device_path = ZoteroAPI.normalizeDevicePath(device_path)
+    end
+    local example_to = device_path ~= "" and device_path or "/storage/emulated/0/Documents/Notes"
+    local text = _(
+        "Zotero on Windows stores paths like:\n"
+            .. "  D:\\Notes\\article.pdf\n\n"
+            .. "On Android you must set:\n"
+            .. "1) Linked files folder = the folder ON THE DEVICE\n"
+            .. "   e.g. /storage/emulated/0/Documents/Notes\n"
+            .. "   (not D:\\Notes — that path does not exist here)\n\n"
+            .. "2) Path mapping (PC → device):\n"
+            .. "   From:  D:\\Notes\n"
+            .. "   To:    "
+            .. example_to
+            .. "\n\n"
+            .. "Tip: /Documents/Notes is expanded to /storage/emulated/0/Documents/Notes when possible.\n"
+            .. "Also enable « Enable linked files folder »."
+    )
+    UIManager:show(InfoMessage:new({
+        text = text,
+        show_icon = false,
+    }))
 end
 
 function Plugin:setWebdavAccount()
@@ -1118,15 +1179,18 @@ function Plugin:suggestPathMapping()
     local dialog
     dialog = MultiInputDialog:new({
         title = _("Suggest path mapping"),
-        description = _("Paste a path as stored in Zotero, then choose the matching folder on this device."),
+        description = _(
+            "Windows example: From = D:\\Notes  →  To = /storage/emulated/0/Documents/Notes\n"
+                .. "Paste a full Zotero path OR just the PC folder prefix."
+        ),
         fields = {
             {
-                text = "",
-                hint = _("Zotero path (from PC), e.g. D:\\Papers\\file.pdf"),
+                text = "D:\\Notes",
+                hint = _("Zotero / PC path prefix, e.g. D:\\Notes"),
             },
             {
-                text = ZoteroAPI.getLinkedFilesBase() or "",
-                hint = _("Device folder containing the file"),
+                text = ZoteroAPI.getLinkedFilesBase() or "/storage/emulated/0/Documents/Notes",
+                hint = _("Same folder on THIS device (Android absolute path)"),
             },
         },
         buttons = {
@@ -1306,15 +1370,34 @@ function Plugin:onZoteroSyncAction()
     end
     NetworkMgr:runWhenOnline(function()
         Trapper:wrap(function()
-            Trapper:info("Synchronizing Zotero library.")
-            local e = ZoteroAPI.syncAllItems(function(msg)
-                Trapper:info(msg)
+            Trapper:info(_("Synchronizing Zotero library…"))
+            local ok, result = pcall(function()
+                return ZoteroAPI.syncAllItems(function(msg)
+                    Trapper:info(tostring(msg))
+                end)
             end)
 
-            if e == nil then
-                Trapper:info("Success")
+            if not ok then
+                Trapper:info(_("Sync crashed: ") .. tostring(result))
+                return
+            end
+            local e = result
+            if e == nil or e == "" then
+                local stats = ZoteroAPI.getStats()
+                Trapper:info(
+                    _("Sync finished.")
+                        .. "\n"
+                        .. _("Items: ")
+                        .. tostring(stats.items)
+                        .. "\n"
+                        .. _("Attachments: ")
+                        .. tostring(stats.attachments)
+                        .. "\n"
+                        .. _("Library version: ")
+                        .. tostring(stats.libVersion)
+                )
             else
-                Trapper:info(e)
+                Trapper:info(tostring(e))
             end
         end)
     end)
