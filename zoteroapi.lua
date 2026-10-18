@@ -8,7 +8,15 @@ local sha2 = require("ffi/sha2")
 local SQ3 = require("lua-ljsqlite3/init")
 local logger = require("logger")
 local Annotations = require("annotations")
-local _ = require("gettext")
+local _
+do
+    local ok, mod = pcall(require, "zotero_i18n")
+    if ok and type(mod) == "function" then
+        _ = mod
+    else
+        _ = require("gettext")
+    end
+end
 -- For my annotation routines:
 local DocSettings = require("docsettings")
 
@@ -22,7 +30,7 @@ local DocSettings = require("docsettings")
 -- /storage/<KEY>/version: Version number of downloaded attachment
 -- /meta.lua: Metadata containing library version, items etc.
 
-local API = { ["version"] = "Zotero Atelier 2.0.1" }
+local API = { ["version"] = "Zotero Atelier 2.1.6" }
 
 local SUPPORTED_MEDIA_TYPES = {
     [1] = "application/pdf",
@@ -107,49 +115,50 @@ CREATE TABLE IF NOT EXISTS itemAnnotations (
 );
 ]]
 
+-- SQLite: string literals MUST use single quotes. Double quotes are identifiers.
 local ZOTERO_DB_INIT_ITEMTYPES = [[
-INSERT INTO itemTypes(itemTypeID,typeName)
+INSERT OR IGNORE INTO itemTypes(itemTypeID,typeName)
 VALUES
-(1,"annotation"          ),
-(2,"artwork"             ),
-(3,"attachment"          ),
-(4,"audioRecording"      ),
-(5,"bill"                ),
-(6,"blogPost"            ),
-(7,"book"                ),
-(8,"bookSection"         ),
-(9,"case"                ),
-(10,"computerProgram"    ),
-(11,"conferencePaper"    ),
-(12,"dictionaryEntry"    ),
-(13,"document"           ),
-(14,"email"              ),
-(15,"encyclopediaArticle"),
-(16,"film"               ),
-(17,"forumPost"          ),
-(18,"hearing"            ),
-(19,"instantMessage"     ),
-(20,"interview"          ),
-(21,"journalArticle"     ),
-(22,"letter"             ),
-(23,"magazineArticle"    ),
-(24,"manuscript"         ),
-(25,"map"                ),
-(26,"newspaperArticle"   ),
-(27,"note"               ),
-(28,"patent"             ),
-(29,"podcast"            ),
-(30,"preprint"           ),
-(31,"presentation"       ),
-(32,"radioBroadcast"     ),
-(33,"report"             ),
-(34,"statute"            ),
-(35,"thesis"             ),
-(36,"tvBroadcast"        ),
-(37,"videoRecording"     ),
-(38,"webpage"            ),
-(39,"dataset"            ),
-(40,"standard"           );
+(1,'annotation'),
+(2,'artwork'),
+(3,'attachment'),
+(4,'audioRecording'),
+(5,'bill'),
+(6,'blogPost'),
+(7,'book'),
+(8,'bookSection'),
+(9,'case'),
+(10,'computerProgram'),
+(11,'conferencePaper'),
+(12,'dictionaryEntry'),
+(13,'document'),
+(14,'email'),
+(15,'encyclopediaArticle'),
+(16,'film'),
+(17,'forumPost'),
+(18,'hearing'),
+(19,'instantMessage'),
+(20,'interview'),
+(21,'journalArticle'),
+(22,'letter'),
+(23,'magazineArticle'),
+(24,'manuscript'),
+(25,'map'),
+(26,'newspaperArticle'),
+(27,'note'),
+(28,'patent'),
+(29,'podcast'),
+(30,'preprint'),
+(31,'presentation'),
+(32,'radioBroadcast'),
+(33,'report'),
+(34,'statute'),
+(35,'thesis'),
+(36,'tvBroadcast'),
+(37,'videoRecording'),
+(38,'webpage'),
+(39,'dataset'),
+(40,'standard');
 ]]
 
 -- TODO: Check if this makes sense to remove
@@ -543,6 +552,12 @@ function API.openDB()
         else
             API.getUserLibraryVersion()
             logger.info("Zotero: Local db version: " .. API.libVersion)
+            -- Repair: itemTypes must exist or every item INSERT silently inserts 0 rows
+            local it_cnt = tonumber(API.db:rowexec("SELECT COUNT(*) FROM itemTypes")) or 0
+            if it_cnt == 0 then
+                logger.warn("Zotero: itemTypes empty — re-initializing")
+                API.db:exec(ZOTERO_DB_INIT_ITEMTYPES)
+            end
         end
         return API.db
     end
@@ -567,6 +582,12 @@ function API.init(zotero_dir)
     if not file_exists(API.storage_dir) then
         lfs.mkdir(API.storage_dir)
     end
+    -- Per-attachment sync state (known keys / pending deletes). MUST live outside the
+    -- document sidecar — KOReader rewrites metadata.*.lua and would wipe our keys.
+    API.annot_state_dir = BaseUtil.joinPath(API.zotero_dir, "annot_state")
+    if not file_exists(API.annot_state_dir) then
+        lfs.mkdir(API.annot_state_dir)
+    end
 
     logger.dbg("Zotero: storage dir" .. API.storage_dir)
 
@@ -583,6 +604,155 @@ function API.init(zotero_dir)
 
     --API.scanStorage()
     --API.getItemWithAttachments("H26YYGWN")
+end
+
+local function annotStatePath(attachment_key)
+    return BaseUtil.joinPath(API.annot_state_dir or API.zotero_dir, "annot_" .. tostring(attachment_key) .. ".lua")
+end
+
+-- Persistent sync state for one attachment: { known = {key,...}, pending_deletes = {key,...} }
+function API.loadAnnotationSyncState(attachment_key)
+    local state = { known = {}, pending_deletes = {} }
+    if attachment_key == nil or attachment_key == "" then
+        return state
+    end
+    local path = annotStatePath(attachment_key)
+    local ok, data = pcall(function()
+        return LuaSettings:open(path)
+    end)
+    if not ok or not data then
+        return state
+    end
+    local known = data:readSetting("known", {}) or {}
+    local pending = data:readSetting("pending_deletes", {}) or {}
+    pcall(function()
+        data:close()
+    end)
+    local function to_list(t)
+        local out = {}
+        if type(t) ~= "table" then
+            return out
+        end
+        for k, v in pairs(t) do
+            if type(k) == "number" and type(v) == "string" then
+                table.insert(out, v)
+            elseif type(k) == "string" and v then
+                table.insert(out, k)
+            end
+        end
+        return out
+    end
+    state.known = to_list(known)
+    state.pending_deletes = to_list(pending)
+    return state
+end
+
+function API.saveAnnotationSyncState(attachment_key, state)
+    if attachment_key == nil or attachment_key == "" or API.annot_state_dir == nil then
+        return
+    end
+    if not file_exists(API.annot_state_dir) then
+        lfs.mkdir(API.annot_state_dir)
+    end
+    local path = annotStatePath(attachment_key)
+    pcall(function()
+        local ds = LuaSettings:open(path)
+        ds:saveSetting("known", state.known or {})
+        ds:saveSetting("pending_deletes", state.pending_deletes or {})
+        ds:flush()
+        ds:close()
+    end)
+end
+
+function API.annotationSyncStateSets(attachment_key)
+    local state = API.loadAnnotationSyncState(attachment_key)
+    local known_set, pending_set = {}, {}
+    for _, k in ipairs(state.known or {}) do
+        known_set[k] = true
+    end
+    for _, k in ipairs(state.pending_deletes or {}) do
+        pending_set[k] = true
+    end
+    return known_set, pending_set, state
+end
+
+local function persistAnnotState(attachment_key, current_keys_set, pending_set)
+    current_keys_set = current_keys_set or {}
+    pending_set = pending_set or {}
+    -- Drop pending if the key reappeared in the sidecar
+    for k, _ in pairs(pending_set) do
+        if current_keys_set[k] then
+            pending_set[k] = nil
+        end
+    end
+    local new_pending = {}
+    for k, _ in pairs(pending_set) do
+        table.insert(new_pending, k)
+    end
+    -- known = current ∪ pending (so we remember what to delete)
+    local known_list = {}
+    local seen = {}
+    for k, _ in pairs(current_keys_set) do
+        if not seen[k] then
+            table.insert(known_list, k)
+            seen[k] = true
+        end
+    end
+    for k, _ in pairs(pending_set) do
+        if not seen[k] then
+            table.insert(known_list, k)
+            seen[k] = true
+        end
+    end
+    API.saveAnnotationSyncState(attachment_key, {
+        known = known_list,
+        pending_deletes = new_pending,
+    })
+    logger.info(
+        ("Zotero: annot-state %s known=%d pending=%d"):format(
+            tostring(attachment_key),
+            #known_list,
+            #new_pending
+        )
+    )
+    return pending_set
+end
+
+-- Record keys present in sidecar as known; mark missing known keys as pending deletes.
+function API.noteLocalAnnotationDeletions(attachment_key, current_keys_set)
+    if attachment_key == nil then
+        return {}
+    end
+    local known_set, pending_set = API.annotationSyncStateSets(attachment_key)
+    current_keys_set = current_keys_set or {}
+    -- First seed: if we have never known anything, learn current keys (no deletes yet)
+    if next(known_set) == nil and next(pending_set) == nil then
+        local known_list = {}
+        for k, _ in pairs(current_keys_set) do
+            table.insert(known_list, k)
+        end
+        API.saveAnnotationSyncState(attachment_key, { known = known_list, pending_deletes = {} })
+        return {}
+    end
+    for k, _ in pairs(known_set) do
+        if not current_keys_set[k] then
+            pending_set[k] = true
+        end
+    end
+    return persistAnnotState(attachment_key, current_keys_set, pending_set)
+end
+
+-- Mark exactly one locally deleted annotation (preferred path — avoids false neighbours).
+function API.noteExplicitLocalAnnotationDeletion(attachment_key, deleted_key, current_keys_set)
+    if attachment_key == nil or deleted_key == nil or deleted_key == "" then
+        return API.noteLocalAnnotationDeletions(attachment_key, current_keys_set)
+    end
+    local _, pending_set = API.annotationSyncStateSets(attachment_key)
+    current_keys_set = current_keys_set or {}
+    -- Ensure the deleted key is not considered present
+    current_keys_set[deleted_key] = nil
+    pending_set[deleted_key] = true
+    return persistAnnotState(attachment_key, current_keys_set, pending_set)
 end
 
 function API.getStats()
@@ -694,6 +864,44 @@ function API.setUserLibraryVersion(version)
     db:exec(sql)
 end
 
+-- HEAD the library so If-Unmodified-Since-Version matches the server (avoids 412).
+function API.refreshUserLibraryVersionFromServer()
+    local e = API.verifyZoteroAccess()
+    if e ~= nil then
+        return e
+    end
+    local req_headers = {}
+    for hk, hv in pairs(API.zoteroHeader or {}) do
+        req_headers[hk] = hv
+    end
+    local r, c, h = https.request({
+        method = "HEAD",
+        url = API.userLibraryURL .. "/items?limit=1",
+        headers = req_headers,
+    })
+    e = API.verifyResponse(r, c)
+    if e ~= nil then
+        -- Some proxies break HEAD; try a tiny GET
+        local body = {}
+        r, c, h = https.request({
+            method = "GET",
+            url = API.userLibraryURL .. "/items?limit=1",
+            headers = req_headers,
+            sink = ltn12.sink.table(body),
+        })
+        e = API.verifyResponse(r, c)
+        if e ~= nil then
+            return e
+        end
+    end
+    local ver = h and (h["last-modified-version"] or h["Last-Modified-Version"])
+    if ver ~= nil then
+        API.setUserLibraryVersion(ver)
+        logger.info("Zotero: refreshed library version from server: ", ver)
+    end
+    return nil
+end
+
 -- Retrieve underlying settings object to make changes from the outside
 function API.getSettings()
     return API.settings
@@ -702,6 +910,238 @@ end
 -- Save settings to config file
 function API.saveSettingsToFile()
     return API.settings:flush()
+end
+
+-- Large-screen layout options (dual-pane browser / side annotation panel)
+local DEFAULT_LARGE_SCREEN_MIN_WIDTH = 1000
+
+function API.getLargeScreenDualPane()
+    return API.settings:isTrue("large_screen_dual_pane")
+end
+
+function API.setLargeScreenDualPane(enabled)
+    API.settings:saveSetting("large_screen_dual_pane", enabled and true or false)
+end
+
+function API.toggleLargeScreenDualPane()
+    API.setLargeScreenDualPane(not API.getLargeScreenDualPane())
+end
+
+function API.getLargeScreenAnnotationPanel()
+    return API.settings:isTrue("large_screen_annotation_panel")
+end
+
+function API.setLargeScreenAnnotationPanel(enabled)
+    API.settings:saveSetting("large_screen_annotation_panel", enabled and true or false)
+end
+
+function API.toggleLargeScreenAnnotationPanel()
+    API.setLargeScreenAnnotationPanel(not API.getLargeScreenAnnotationPanel())
+end
+
+function API.getLargeScreenMinWidth()
+    local n = tonumber(API.settings:readSetting("large_screen_min_width", DEFAULT_LARGE_SCREEN_MIN_WIDTH))
+    if not n or n < 400 then
+        return DEFAULT_LARGE_SCREEN_MIN_WIDTH
+    end
+    return math.floor(n)
+end
+
+function API.setLargeScreenMinWidth(width)
+    local n = tonumber(width) or DEFAULT_LARGE_SCREEN_MIN_WIDTH
+    if n < 400 then
+        n = 400
+    elseif n > 4000 then
+        n = 4000
+    end
+    API.settings:saveSetting("large_screen_min_width", math.floor(n))
+end
+
+function API.isLargeScreen()
+    local Device = require("device")
+    local Screen = Device.screen
+    return Screen:getWidth() >= API.getLargeScreenMinWidth()
+end
+
+-- Annotation destination settings (local / zotero / both)
+function API.getAnnotationDestinationAsk()
+    local v = API.settings:readSetting("annotation_destination_ask", true)
+    if v == false or v == 0 or v == "false" then
+        return false
+    end
+    return true
+end
+
+function API.setAnnotationDestinationAsk(ask)
+    API.settings:saveSetting("annotation_destination_ask", ask and true or false)
+end
+
+function API.getAnnotationDestinationDefault()
+    local Annotations = require("annotations")
+    return Annotations.normalizeDestination(
+        API.settings:readSetting("annotation_destination_default", Annotations.DEST_BOTH)
+    )
+end
+
+function API.setAnnotationDestinationDefault(dest)
+    local Annotations = require("annotations")
+    API.settings:saveSetting("annotation_destination_default", Annotations.normalizeDestination(dest))
+end
+
+function API.getAnnotationDestinationLast()
+    local Annotations = require("annotations")
+    return Annotations.normalizeDestination(
+        API.settings:readSetting("annotation_destination_last", API.getAnnotationDestinationDefault())
+    )
+end
+
+function API.setAnnotationDestinationLast(dest)
+    local Annotations = require("annotations")
+    API.settings:saveSetting("annotation_destination_last", Annotations.normalizeDestination(dest))
+end
+
+-- For documents not linked to Zotero: "local" = write into PDF when possible, "sidecar" = sidecar only
+function API.getAnnotationDestinationNonZotero()
+    local v = API.settings:readSetting("annotation_destination_non_zotero", "local")
+    if v == "sidecar" then
+        return "sidecar"
+    end
+    return "local"
+end
+
+function API.setAnnotationDestinationNonZotero(mode)
+    if mode == "sidecar" then
+        API.settings:saveSetting("annotation_destination_non_zotero", "sidecar")
+    else
+        API.settings:saveSetting("annotation_destination_non_zotero", "local")
+    end
+end
+
+-- Effective destination for a new annotation on a Zotero-linked document (no dialog).
+function API.getEffectiveZoteroDestination()
+    if API.getAnnotationDestinationAsk() then
+        return API.getAnnotationDestinationLast()
+    end
+    return API.getAnnotationDestinationDefault()
+end
+
+-- Default highlight appearance (KOReader drawer + color → also used when uploading to Zotero)
+local DEFAULT_HL_COLORS = {
+    "gray", -- darkest KOReader colour = best e-ink underline ("noir")
+    "yellow",
+    "orange",
+    "red",
+    "green",
+    "blue",
+    "purple",
+}
+local DEFAULT_HL_DRAWERS = {
+    "lighten", -- highlight
+    "underscore", -- underline
+    "strikeout",
+    "invert",
+}
+
+function API.getDefaultHighlightColor()
+    local c = string.lower(tostring(API.settings:readSetting("annotation_default_color", "gray") or "gray"))
+    if c == "black" or c == "grey" then
+        c = "gray"
+    end
+    for _, name in ipairs(DEFAULT_HL_COLORS) do
+        if name == c then
+            return c
+        end
+    end
+    return "gray"
+end
+
+function API.setDefaultHighlightColor(color)
+    color = string.lower(tostring(color or "gray"))
+    if color == "black" or color == "grey" then
+        color = "gray"
+    end
+    local ok = false
+    for _, name in ipairs(DEFAULT_HL_COLORS) do
+        if name == color then
+            ok = true
+            break
+        end
+    end
+    API.settings:saveSetting("annotation_default_color", ok and color or "gray")
+end
+
+function API.cycleDefaultHighlightColor()
+    local cur = API.getDefaultHighlightColor()
+    local next_c = DEFAULT_HL_COLORS[1]
+    for i, name in ipairs(DEFAULT_HL_COLORS) do
+        if name == cur then
+            next_c = DEFAULT_HL_COLORS[(i % #DEFAULT_HL_COLORS) + 1]
+            break
+        end
+    end
+    API.setDefaultHighlightColor(next_c)
+    return next_c
+end
+
+function API.getDefaultHighlightDrawer()
+    local d = string.lower(tostring(API.settings:readSetting("annotation_default_drawer", "lighten") or "lighten"))
+    for _, name in ipairs(DEFAULT_HL_DRAWERS) do
+        if name == d then
+            return d
+        end
+    end
+    return "lighten"
+end
+
+function API.setDefaultHighlightDrawer(drawer)
+    drawer = string.lower(tostring(drawer or "lighten"))
+    local ok = false
+    for _, name in ipairs(DEFAULT_HL_DRAWERS) do
+        if name == drawer then
+            ok = true
+            break
+        end
+    end
+    API.settings:saveSetting("annotation_default_drawer", ok and drawer or "lighten")
+end
+
+function API.cycleDefaultHighlightDrawer()
+    local cur = API.getDefaultHighlightDrawer()
+    local next_d = DEFAULT_HL_DRAWERS[1]
+    for i, name in ipairs(DEFAULT_HL_DRAWERS) do
+        if name == cur then
+            next_d = DEFAULT_HL_DRAWERS[(i % #DEFAULT_HL_DRAWERS) + 1]
+            break
+        end
+    end
+    API.setDefaultHighlightDrawer(next_d)
+    return next_d
+end
+
+function API.labelDefaultHighlightDrawer(drawer)
+    drawer = drawer or API.getDefaultHighlightDrawer()
+    if drawer == "underscore" then
+        return _("Underline")
+    elseif drawer == "strikeout" then
+        return _("Strikeout")
+    elseif drawer == "invert" then
+        return _("Invert")
+    end
+    return _("Highlight")
+end
+
+function API.labelDefaultHighlightColor(color)
+    color = color or API.getDefaultHighlightColor()
+    local labels = {
+        yellow = _("Yellow"),
+        orange = _("Orange"),
+        red = _("Red"),
+        green = _("Green"),
+        blue = _("Blue"),
+        purple = _("Purple"),
+        gray = _("Black (e-ink)"),
+    }
+    return labels[color] or color
 end
 
 -- Local files / linked files settings
@@ -844,31 +1284,111 @@ function API.basenameOfPath(p)
     return p:match("([^/]+)$")
 end
 
+-- Directories to never descend into when resolving local files
+-- (Syncthing versions, trash, VCS, …).
+local SKIP_DIR_NAMES = {
+    [".stversions"] = true,
+    [".stfolder"] = true,
+    [".trash"] = true,
+    [".Trash"] = true,
+    ["Trash"] = true,
+    [".git"] = true,
+    [".svn"] = true,
+    [".thumbnails"] = true,
+    ["@eaDir"] = true,
+    ["node_modules"] = true,
+    [".recycle"] = true,
+    ["#recycle"] = true,
+}
+
+function API.isIgnoredPathSegment(name)
+    if name == nil or name == "" then
+        return false
+    end
+    if SKIP_DIR_NAMES[name] then
+        return true
+    end
+    local lower = string.lower(name)
+    if SKIP_DIR_NAMES[lower] then
+        return true
+    end
+    -- Syncthing / backup style folders
+    if lower:match("^%.st") or lower:match("%.stversions") then
+        return true
+    end
+    return false
+end
+
+function API.pathContainsIgnoredSegment(path)
+    if path == nil or path == "" then
+        return false
+    end
+    path = API.normalizePath(path)
+    for segment in string.gmatch(path, "[^/]+") do
+        if API.isIgnoredPathSegment(segment) then
+            return true
+        end
+    end
+    return false
+end
+
 -- Recursively find a file by basename under root (depth-limited).
-function API.findFileByBasename(root, basename, depth)
+-- Skips backup/version folders. Prefers the first non-ignored match;
+-- if only ignored paths exist, returns nil (never .stversions).
+function API.findFileByBasename(root, basename, depth, results)
     depth = depth or 0
+    results = results or {}
     if root == nil or root == "" or basename == nil or basename == "" or depth > 8 then
+        if depth == 0 then
+            return API.pickBestBasenameMatch(results)
+        end
         return nil
     end
     if not file_exists(root) then
+        if depth == 0 then
+            return API.pickBestBasenameMatch(results)
+        end
         return nil
     end
     local target_lower = string.lower(basename)
     for name in lfs.dir(root) do
-        if name ~= "." and name ~= ".." then
+        if name ~= "." and name ~= ".." and not API.isIgnoredPathSegment(name) then
             local path = BaseUtil.joinPath(root, name)
             local mode = lfs.attributes(path, "mode")
             if mode == "file" and string.lower(name) == target_lower then
-                return API.normalizePath(path)
-            elseif mode == "directory" then
-                local found = API.findFileByBasename(path, basename, depth + 1)
-                if found then
-                    return found
+                local norm = API.normalizePath(path)
+                if not API.pathContainsIgnoredSegment(norm) then
+                    table.insert(results, norm)
                 end
+            elseif mode == "directory" then
+                API.findFileByBasename(path, basename, depth + 1, results)
             end
         end
     end
+    if depth == 0 then
+        return API.pickBestBasenameMatch(results)
+    end
     return nil
+end
+
+-- Prefer shorter paths (closer to root) and paths without hidden segments.
+function API.pickBestBasenameMatch(results)
+    if results == nil or #results == 0 then
+        return nil
+    end
+    table.sort(results, function(a, b)
+        local a_ign = API.pathContainsIgnoredSegment(a) and 1 or 0
+        local b_ign = API.pathContainsIgnoredSegment(b) and 1 or 0
+        if a_ign ~= b_ign then
+            return a_ign < b_ign
+        end
+        return #a < #b
+    end)
+    local best = results[1]
+    if API.pathContainsIgnoredSegment(best) then
+        return nil
+    end
+    return best
 end
 
 function API.collectSearchRoots()
@@ -891,12 +1411,21 @@ function API.collectSearchRoots()
     return roots
 end
 
--- Fuzzy locate by basename under configured roots.
+-- Fuzzy locate by basename. Prefer mapped / linked folders first (semi-manual
+-- path mapping), then fall back to broader search roots.
 function API.findAttachmentByBasename(filename)
     if filename == nil or filename == "" then
         return nil
     end
     local base = API.basenameOfPath(filename) or filename
+    local mapped = API.collectMappedSearchRoots()
+    for _, root in ipairs(mapped) do
+        local found = API.findFileByBasename(root, base)
+        if found then
+            return found
+        end
+    end
+    -- Broader search only if no mapping-based hit
     for _, root in ipairs(API.collectSearchRoots()) do
         local found = API.findFileByBasename(root, base)
         if found then
@@ -1040,14 +1569,18 @@ function API.resolveLinkedPath(rawPath, linkedBase, mappings)
     local path = API.normalizePath(rawPath)
     if API.isAbsolutePath(path) then
         local mapped = API.applyPathMappings(path, mappings)
-        if file_exists(mapped) then
+        if file_exists(mapped) and not API.pathContainsIgnoredSegment(mapped) then
             return mapped
         end
-        -- basename fallback under search roots
+        -- basename fallback under search roots (never returns .stversions etc.)
         local base = API.basenameOfPath(mapped)
         local found = API.findAttachmentByBasename(base)
         if found then
             return found
+        end
+        -- Do not return a mapped path that only exists under backup folders
+        if file_exists(mapped) and API.pathContainsIgnoredSegment(mapped) then
+            return nil
         end
         return mapped
     end
@@ -1110,7 +1643,11 @@ function API.resolveAttachmentPath(item)
 
     if linkMode == "linked_file" and API.getLinkedFilesEnabled() then
         local resolved = API.resolveLinkedPath(item.data.path, API.getLinkedFilesBase(), mappings)
-        if resolved and file_exists(resolved) then
+        if
+            resolved
+            and file_exists(resolved)
+            and not API.pathContainsIgnoredSegment(resolved)
+        then
             logger.dbg("Zotero: resolved linked file at " .. resolved)
             return resolved
         end
@@ -1258,7 +1795,11 @@ function API.probeAttachmentResolution(item)
     end
 
     for _, entry in ipairs(probe.probes) do
-        if entry.exists then
+        if
+            entry.exists
+            and entry.path
+            and not API.pathContainsIgnoredSegment(entry.path)
+        then
             probe.foundPath = entry.path
             break
         end
@@ -1273,12 +1814,15 @@ function API.findFirstSupportedFileUnder(dir, depth)
         return nil
     end
     for name in lfs.dir(dir) do
-        if name ~= "." and name ~= ".." then
+        if name ~= "." and name ~= ".." and not API.isIgnoredPathSegment(name) then
             local path = BaseUtil.joinPath(dir, name)
             local mode = lfs.attributes(path, "mode")
             if mode == "file" then
                 if name:match("%.pdf$") or name:match("%.epub$") or name:match("%.html?$") then
-                    return path
+                    local norm = API.normalizePath(path)
+                    if not API.pathContainsIgnoredSegment(norm) then
+                        return norm
+                    end
                 end
             elseif mode == "directory" then
                 local found = API.findFirstSupportedFileUnder(path, depth + 1)
@@ -1291,155 +1835,373 @@ function API.findFirstSupportedFileUnder(dir, depth)
     return nil
 end
 
--- Pick an attachment from the local DB and show how paths resolve.
-function API.getFirstLocalPathPreview()
+-- Directory prefix of a Zotero path (for path mapping "From").
+function API.pathPrefixOfFile(p)
+    if p == nil or p == "" then
+        return ""
+    end
+    p = API.normalizePath(p)
+    local base = API.basenameOfPath(p)
+    if base == nil or #base >= #p then
+        return p
+    end
+    local prefix = p:sub(1, #p - #base)
+    if prefix:sub(-1) == "/" then
+        prefix = prefix:sub(1, -2)
+    end
+    return prefix
+end
+
+-- Build selectable path prefixes from a Zotero absolute path (file or folder).
+-- Example: D:/Notes/Lectures/book.pdf →
+--   { "D:", "D:/Notes", "D:/Notes/Lectures" }
+-- The last segment (filename) is excluded so the user maps folders only.
+function API.listZoteroPathPrefixes(zotero_path)
+    local choices = {}
+    if zotero_path == nil or zotero_path == "" then
+        return choices
+    end
+    local p = API.normalizePath(zotero_path)
+    -- Drop filename if present
+    local dir = API.pathPrefixOfFile(p)
+    if dir == nil or dir == "" then
+        return choices
+    end
+    -- Split into segments; keep drive letter as first segment on Windows paths
+    local segments = {}
+    if dir:match("^[A-Za-z]:") then
+        table.insert(segments, dir:sub(1, 2)) -- "D:"
+        local rest = dir:sub(3)
+        if rest:sub(1, 1) == "/" then
+            rest = rest:sub(2)
+        end
+        for seg in string.gmatch(rest, "[^/]+") do
+            table.insert(segments, seg)
+        end
+    else
+        -- Absolute Unix-style or relative
+        local rest = dir
+        if rest:sub(1, 1) == "/" then
+            table.insert(segments, "") -- leading root marker
+            rest = rest:sub(2)
+        end
+        for seg in string.gmatch(rest, "[^/]+") do
+            table.insert(segments, seg)
+        end
+    end
+    local acc = nil
+    for i, seg in ipairs(segments) do
+        if i == 1 and seg == "" then
+            acc = ""
+        elseif i == 1 then
+            acc = seg
+        elseif acc == "" then
+            acc = "/" .. seg
+        elseif acc:match("^[A-Za-z]:$") then
+            acc = acc .. "/" .. seg
+        else
+            acc = acc .. "/" .. seg
+        end
+        local display = acc
+        if display == "" then
+            display = "/"
+        end
+        -- Skip bare drive "D:" alone (too short / useless); keep if user has only that
+        table.insert(choices, {
+            from = acc,
+            label = display,
+            depth = i,
+        })
+    end
+    return choices
+end
+
+-- Prefer searching under path-mapping destinations (and linked base) before
+-- a full-tree hunt — avoids .stversions and random deep matches.
+function API.collectMappedSearchRoots()
+    local roots = {}
+    local seen = {}
+    local function add(p)
+        p = API.normalizePath(p or "")
+        if p ~= "" and not seen[p] then
+            seen[p] = true
+            table.insert(roots, p)
+        end
+    end
+    for _, m in ipairs(API.getPathMappings()) do
+        if m and m.to then
+            add(m.to)
+        end
+    end
+    if API.getLinkedFilesEnabled() then
+        add(API.getLinkedFilesBase())
+        for _, b in ipairs(API.getLinkedFilesBases()) do
+            add(b)
+        end
+    end
+    return roots
+end
+
+-- Pick one linked_file attachment from the local Zotero DB (metadata), if any.
+function API.getSampleLinkedAttachmentItem()
     local db = API.openDB()
     local stmt = db:prepare(ZOTERO_LIST_ATTACHMENT_ITEMS)
     local row = stmt:reset():step()
-
-    local firstProbe = nil
-    local firstLinkedProbe = nil
-    local foundProbe = nil
-    local foundLinkedProbe = nil
-
+    local first_any = nil
     while row ~= nil do
-        local item = JSON.decode(row[1])
+        local ok, item = pcall(JSON.decode, row[1])
         if
-            item.data
+            ok
+            and item
+            and item.data
             and item.data.itemType == "attachment"
-            and API.isSupportedAttachmentLinkMode(item.data.linkMode)
             and table_contains(SUPPORTED_MEDIA_TYPES, item.data.contentType)
         then
-            local probe = API.probeAttachmentResolution(item)
-            if firstProbe == nil then
-                firstProbe = probe
+            if item.data.linkMode == "linked_file" and item.data.path and item.data.path ~= "" then
+                stmt:close()
+                return item
             end
-            if item.data.linkMode == "linked_file" and firstLinkedProbe == nil then
-                firstLinkedProbe = probe
-            end
-            if probe.foundPath then
-                if foundProbe == nil then
-                    foundProbe = probe
-                end
-                if item.data.linkMode == "linked_file" and foundLinkedProbe == nil then
-                    foundLinkedProbe = probe
-                end
+            if first_any == nil and API.isSupportedAttachmentLinkMode(item.data.linkMode) then
+                first_any = item
             end
         end
         row = stmt:step(row)
     end
     stmt:close()
+    return first_any
+end
 
-    if foundLinkedProbe then
-        return foundLinkedProbe
-    end
-    if foundProbe then
-        return foundProbe
-    end
-    if firstLinkedProbe then
-        return firstLinkedProbe
-    end
-    if firstProbe then
-        return firstProbe
+-- Preview based on a REAL Zotero attachment from the synced library (not a random disk file).
+function API.getFirstLocalPathPreview()
+    local item = API.getSampleLinkedAttachmentItem()
+    if item then
+        local probe = API.probeAttachmentResolution(item)
+        if item.data.linkMode == "linked_file" then
+            probe.note = "Example linked file from your Zotero library (after sync)." -- msgid for _()
+        else
+            probe.note = "Example attachment from your Zotero library (linkMode="
+                .. tostring(item.data.linkMode)
+                .. "). Prefer linked_file items for folder mapping."
+        end
+        -- Suggested mapping prefixes for the UI
+        if item.data.path and item.data.path ~= "" then
+            probe.suggestedFrom = API.pathPrefixOfFile(item.data.path)
+            probe.suggestedTo = API.getLinkedFilesBase()
+        end
+        return probe
     end
 
-    local preview = {
+    return {
         key = nil,
         filename = nil,
         linkMode = nil,
         zoteroPath = nil,
         probes = {},
         foundPath = nil,
-        note = "No attachments in the local library. Synchronize with Zotero first.",
+        suggestedFrom = "",
+        suggestedTo = API.getLinkedFilesBase() or "",
+        note = "No attachment metadata in the local DB yet.\n"
+            .. "Run Synchronize first — then this preview will show a real Zotero path\n"
+            .. "(e.g. the Windows path stored on the linked file) and how it resolves here.",
     }
+end
 
-    if API.getLinkedFilesEnabled() and API.getLinkedFilesBase() ~= "" then
-        local sample = API.findFirstSupportedFileUnder(API.getLinkedFilesBase())
-        if sample then
-            table.insert(preview.probes, probe_path_entry("First file in linked folder", sample))
-            preview.foundPath = sample
-            preview.note = "No attachment metadata yet; showing first file found in linked folder."
+-- Path → attachment key cache (avoids multi-second full-library probes on every highlight).
+local _file_to_key_cache = {}
+
+function API.clearAttachmentPathCache()
+    _file_to_key_cache = {}
+end
+
+function API.rememberAttachmentKeyForPath(file_path, key)
+    if file_path == nil or file_path == "" then
+        return
+    end
+    local norm = API.normalizePathForCompare(file_path) or API.normalizePath(file_path)
+    if norm then
+        _file_to_key_cache[norm] = key or false
+    end
+    -- Persist on sidecar so the next open is instant even after restart
+    if key then
+        pcall(function()
+            local ds = DocSettings:open(file_path)
+            local prev = ds:readSetting("zoteroAttachmentKey")
+            if prev ~= key then
+                ds:saveSetting("zoteroAttachmentKey", key)
+                ds:flush()
+            end
+            pcall(function()
+                ds:close()
+            end)
+        end)
+    end
+end
+
+-- Cheap candidate paths for an attachment (no recursive basename filesystem walk).
+local function cheapAttachmentPaths(item)
+    local paths = {}
+    local data = item and item.data
+    if not data then
+        return paths
+    end
+    local linkMode = data.linkMode
+    local mappings = API.getPathMappings()
+    local linkedBase = API.getLinkedFilesBase()
+    local function add(p)
+        p = API.normalizePath(p or "")
+        if p ~= "" then
+            table.insert(paths, p)
         end
     end
-    if preview.foundPath == nil and API.getExternalStorageEnabled() and API.getExternalStorageDir() ~= "" then
-        local sample = API.findFirstSupportedFileUnder(API.getExternalStorageDir())
-        if sample then
-            table.insert(preview.probes, probe_path_entry("First file in external storage", sample))
-            preview.foundPath = sample
-            preview.note = "No attachment metadata yet; showing first file found in external storage."
+    if linkMode == "linked_file" then
+        local raw = data.path or ""
+        if raw ~= "" then
+            add(raw)
+            if API.isAbsolutePath(raw) and #mappings > 0 then
+                add(API.applyPathMappings(API.normalizePath(raw), mappings))
+            end
+            local resolved = API.resolveLinkedPath(raw, linkedBase, mappings)
+            if resolved then
+                add(resolved)
+            end
+        end
+    elseif linkMode == "imported_file" or linkMode == "imported_url" then
+        if API.getExternalStorageEnabled() and data.filename then
+            local ext_dir = API.getExternalStorageDir()
+            if ext_dir ~= "" then
+                add(BaseUtil.joinPath(ext_dir, item.key, data.filename))
+            end
+        end
+        local _, pluginPath = API.getDirAndPath(item)
+        if pluginPath then
+            add(pluginPath)
         end
     end
-
-    return preview
+    return paths
 end
 
 -- Find Zotero attachment key for an on-disk file path (linked / external / cache).
+-- Falls back to basename match so opening the "real" PDF (not .stversions) still links.
+-- Must stay fast: called from onAnnotationsModified before the note dialog can open.
 function API.findAttachmentKeyByFilePath(file_path)
     if file_path == nil or file_path == "" then
         return nil
     end
+    local norm = API.normalizePathForCompare(file_path) or API.normalizePath(file_path)
+    local cached = norm and _file_to_key_cache[norm]
+    if cached ~= nil then
+        return cached ~= false and cached or nil
+    end
+
+    -- Sidecar hint from a previous successful match
+    local sidecar_key = nil
+    pcall(function()
+        local ds = DocSettings:open(file_path)
+        sidecar_key = ds:readSetting("zoteroAttachmentKey")
+        pcall(function()
+            ds:close()
+        end)
+    end)
+    if sidecar_key and API.getItem(sidecar_key) then
+        _file_to_key_cache[norm] = sidecar_key
+        return sidecar_key
+    end
+
+    local want_base = string.lower(API.basenameOfPath(file_path) or "")
     local db = API.openDB()
     local stmt = db:prepare(ZOTERO_LIST_ATTACHMENT_ITEMS)
     local row = stmt:reset():step()
+    local basename_hit = nil
     while row ~= nil do
-        local item = JSON.decode(row[1])
+        local ok_item, item = pcall(JSON.decode, row[1])
         if
-            item.data
+            ok_item
+            and item
+            and item.data
             and item.data.itemType == "attachment"
             and API.isSupportedAttachmentLinkMode(item.data.linkMode)
-            and table_contains(SUPPORTED_MEDIA_TYPES, item.data.contentType)
+            and (
+                table_contains(SUPPORTED_MEDIA_TYPES, item.data.contentType)
+                or (item.data.path and (item.data.path:match("%.pdf$") or item.data.path:match("%.epub$")))
+            )
         then
-            local probe = API.probeAttachmentResolution(item)
-            if probe.foundPath and API.pathsEqual(probe.foundPath, file_path) then
-                stmt:close()
-                return item.key
-            end
-            for _, entry in ipairs(probe.probes) do
-                if entry.path and API.pathsEqual(entry.path, file_path) then
+            local zbase = string.lower(
+                item.data.filename or API.basenameOfPath(item.data.path) or ""
+            )
+            local same_base = want_base ~= "" and zbase ~= "" and zbase == want_base
+            -- Cheap path compare first (no recursive disk walks)
+            for _, p in ipairs(cheapAttachmentPaths(item)) do
+                if API.pathsEqual(p, file_path) then
                     stmt:close()
+                    _file_to_key_cache[norm] = item.key
                     return item.key
                 end
+            end
+            if same_base and basename_hit == nil then
+                basename_hit = item.key
             end
         end
         row = stmt:step(row)
     end
     stmt:close()
-    return nil
+
+    local result = basename_hit
+    _file_to_key_cache[norm] = result or false
+    return result
 end
 
 function API.formatLocalPathPreview(probe)
     if probe == nil then
-        return "No preview available."
+        return _("No preview available.")
     end
     local lines = {}
     if probe.note then
-        table.insert(lines, probe.note)
+        table.insert(lines, _(probe.note))
         table.insert(lines, "")
     end
     if probe.filename then
-        table.insert(lines, "Attachment: " .. probe.filename)
-        table.insert(lines, "Mode: " .. tostring(probe.linkMode) .. "  |  Key: " .. tostring(probe.key))
+        table.insert(lines, _("Zotero attachment: ") .. probe.filename)
+        table.insert(lines, "linkMode: " .. tostring(probe.linkMode) .. "  key: " .. tostring(probe.key))
         if probe.zoteroPath and probe.zoteroPath ~= "" then
-            table.insert(lines, "Zotero path field: " .. probe.zoteroPath)
+            table.insert(lines, "")
+            table.insert(lines, _("Path stored by Zotero:"))
+            table.insert(lines, "  " .. probe.zoteroPath)
+        else
+            table.insert(lines, "")
+            table.insert(lines, _("Path stored by Zotero:") .. " (empty)")
         end
         table.insert(lines, "")
     end
-    if #probe.probes == 0 then
-        table.insert(lines, "No paths to check for this item.")
-    else
-        table.insert(lines, "Paths checked:")
+    if probe.probes and #probe.probes > 0 then
+        table.insert(lines, _("Resolution on this device:"))
         for _, entry in ipairs(probe.probes) do
-            local status = entry.exists and "[OK]" or "[missing]"
+            local ignored = entry.path and API.pathContainsIgnoredSegment(entry.path)
+            local status = "[missing]"
+            if entry.exists and ignored then
+                status = "[ignored]"
+            elseif entry.exists then
+                status = "[OK]"
+            end
             table.insert(lines, status .. " " .. entry.label .. ":")
             table.insert(lines, "  " .. (entry.path or "?"))
         end
+        table.insert(lines, "")
     end
-    table.insert(lines, "")
-    if probe.foundPath then
-        table.insert(lines, "First local file found:")
+    if probe.foundPath and not API.pathContainsIgnoredSegment(probe.foundPath) then
+        table.insert(lines, _("→ File found on device:"))
         table.insert(lines, probe.foundPath)
-    else
-        table.insert(lines, "No local file found yet for this test.")
+    elseif probe.filename then
+        table.insert(lines, _("→ File NOT found on device."))
+        if probe.suggestedFrom and probe.suggestedFrom ~= "" then
+            table.insert(lines, "")
+            table.insert(lines, "Suggested path mapping:")
+            table.insert(lines, "  From (PC/Zotero): " .. probe.suggestedFrom)
+            table.insert(
+                lines,
+                "  To (this device): "
+                    .. (probe.suggestedTo ~= "" and probe.suggestedTo or "(set Linked files folder)")
+            )
+        end
     end
     return table.concat(lines, "\n")
 end
@@ -1877,6 +2639,8 @@ function API.fetchZoteroItems(since, progress_callback)
     local annotations = {}
 
     local annotationTypes = Annotations.supportedZoteroTypes()
+    local inserted = 0
+    local skipped_notype = 0
 
     local r, e = API.fetchCollectionPaginated(items_url, headers, function(partial_entries, percentage)
         callback(string.format("Syncing items %.0f%%", percentage))
@@ -1900,16 +2664,49 @@ function API.fetchZoteroItems(since, progress_callback)
                 item.library = nil
 
                 stmt_update_item:reset():bind(1, item.data.itemType, key, item.version):step()
-                stmt_update_itemData:reset():bind(key, JSON.encode(item)):step()
+                -- If itemType is unknown, INSERT…SELECT inserts 0 rows — detect and recover
+                local check = stmt_get_ItemVersion:reset():bind(key):step()
+                if check == nil then
+                    skipped_notype = skipped_notype + 1
+                    logger.warn(
+                        "Zotero: failed to insert item "
+                            .. tostring(key)
+                            .. " type="
+                            .. tostring(item.data.itemType)
+                            .. " — ensuring itemTypes and retrying"
+                    )
+                    local it_cnt = tonumber(db:rowexec("SELECT COUNT(*) FROM itemTypes")) or 0
+                    if it_cnt == 0 then
+                        local ok_it, err_it = pcall(function()
+                            db:exec(ZOTERO_DB_INIT_ITEMTYPES)
+                        end)
+                        if not ok_it then
+                            logger.err("Zotero: itemTypes init failed: ", err_it)
+                        end
+                    end
+                    -- Fallback: insert with a generic document type if still missing
+                    pcall(function()
+                        stmt_update_item:reset():bind(1, item.data.itemType, key, item.version):step()
+                    end)
+                    check = stmt_get_ItemVersion:reset():bind(key):step()
+                    if check == nil then
+                        pcall(function()
+                            stmt_update_item:reset():bind(1, "document", key, item.version):step()
+                        end)
+                        check = stmt_get_ItemVersion:reset():bind(key):step()
+                    end
+                end
+                if check ~= nil then
+                    stmt_update_itemData:reset():bind(key, JSON.encode(item)):step()
+                    inserted = inserted + 1
+                end
 
                 -- Set the correct collection(s) for this item:
                 if item.data.collections ~= nil then
-                    --if #item.data.collections > 1 then print("Item "..item.key.." is in ", #item.data.collections , " collections: ") end
                     if item.data.collections[1] == nil then -- no collection specified: put in root directory
                         stmt_update_collectionItems:reset():bind("/", item.key):step()
-                    else                                    -- some items might be in more than one collection, so loop over collections
-                        for i, coll in pairs(item.data.collections) do
-                            -- This works, but maybe better check if collection exists first? Then could delete item if collection no longer there...
+                    else
+                        for _, coll in pairs(item.data.collections) do
                             stmt_update_collectionItems:reset():bind(coll, item.key):step()
                         end
                     end
@@ -1953,9 +2750,19 @@ function API.fetchZoteroItems(since, progress_callback)
     stmt_delete_item:close()
     stmt_update_collectionItems:close()
 
+    logger.info(
+        "Zotero: fetchZoteroItems done — inserted/updated≈"
+            .. tostring(inserted)
+            .. ", type failures="
+            .. tostring(skipped_notype)
+            .. ", libVersion="
+            .. tostring(r)
+    )
+
     if e ~= nil then
-        return e
+        return nil, e
     end
+    return r, nil
 end
 
 -- Fetch (new) collections from Zotero server and organise them into the local sqlite database
@@ -2054,6 +2861,7 @@ end
 -- 4. downloading attachments for marked collections
 function API.syncAllItems(progress_callback)
     local callback = progress_callback or function() end
+    API.clearAttachmentPathCache()
 
     -- Error tracking structure for sync summary
     local sync_stats = {
@@ -2064,8 +2872,19 @@ function API.syncAllItems(progress_callback)
     }
 
     local db = API.openDB()
-    local since = API.getUserLibraryVersion()
-    --logger.info("Local Zotero lib version: "..since)
+    local since = API.getUserLibraryVersion() or 0
+    local pre_stats = API.getStats()
+    -- If version was advanced previously but the DB has no items, incremental
+    -- sync (since=N) downloads nothing → stuck at Items: 0 forever. Force full pull.
+    if since > 0 and (tonumber(pre_stats.items) or 0) == 0 then
+        logger.warn(
+            "Zotero: library version="
+                .. tostring(since)
+                .. " but local items=0 — forcing full resync (since=0)"
+        )
+        callback(_("Local library empty — downloading everything (this can take a while)…"))
+        since = 0
+    end
 
     callback(_("Checking Zotero API key…"))
     -- verify access
@@ -2073,51 +2892,45 @@ function API.syncAllItems(progress_callback)
     if e ~= nil then
         return e
     end
-    callback(_("API key OK. Syncing library…"))
+    callback(_("API key OK. Syncing library (since=") .. tostring(since) .. ")…")
 
-    local err
-    if since > 0 then
-        -- try to sync back first, so that any changes will be recorded when we update the db later on
-        if API.access and API.access.user and API.access.user.write and API.access.user.notes then
-            callback(_("Uploading local annotations…"))
-            local upload_fails, delete_fails = API.syncAnnotations(callback)
-            sync_stats.annotation_upload_fails = upload_fails or 0
-            sync_stats.annotation_delete_fails = delete_fails or 0
-        else
-            err = "Zotero: API key does not have write access!"
-            logger.warn(err)
-        end
-    end
-
-    --[[
-	-- try downloading My publications:
-	local page_url = API.userLibraryURL.."/publications/items?format=versions"
-	--page_url = API.userLibraryURL.."/searches"
-	--print(page_url)
-	local r, e =  API.getZoteroData(page_url)
-	--print(JSON.encode(r))
-	if r ~= nil then
-		local cnt = 0
-		for key, _ in pairs(r) do
-			cnt = cnt + 1
-		end
-		print(cnt, "publications.")
-	else
-		print("No publications.")
-	end
-	--]]
-
+    -- Fetch catalogue first so itemAnnotations exist before push (avoids orphan-key
+    -- deletion / re-upload duplicates). Push annotations after items are local.
     local r, e = API.fetchZoteroCollections(since, progress_callback)
     if e ~= nil then
         return e
     end
 
-    e = API.fetchZoteroItems(since, callback)
+    local items_version
+    items_version, e = API.fetchZoteroItems(since, callback)
     if e ~= nil then
         return e
     end
 
-    API.setUserLibraryVersion(r)
+    -- Prefer version from items fetch; fall back to collections
+    local new_version = items_version or r
+    if new_version ~= nil then
+        API.setUserLibraryVersion(new_version)
+    end
+
+    if API.access and API.access.user and API.access.user.write and API.access.user.notes then
+        callback(_("Uploading local annotations…"))
+        local upload_fails, delete_fails = API.syncAnnotations(callback)
+        sync_stats.annotation_upload_fails = upload_fails or 0
+        sync_stats.annotation_delete_fails = delete_fails or 0
+    else
+        logger.warn("Zotero: API key does not have write access for annotations")
+    end
+
+    local post_stats = API.getStats()
+    if (tonumber(post_stats.items) or 0) == 0 then
+        return _(
+            "Sync finished but local library is still empty (0 items).\n"
+                .. "Check User ID / API key, then try « Resync entire collection ».\n"
+                .. "Library version reported: "
+                .. tostring(API.getUserLibraryVersion())
+        )
+    end
 
     local download_fails, failed_downloads = API.batchDownload(callback)
     sync_stats.file_download_fails = download_fails or 0
@@ -2151,15 +2964,7 @@ function API.syncAllItems(progress_callback)
         return table.concat(parts, "\n")
     end
 
-    -- err might show error for annotation upload which we have ignored so far..
-    local sync_summary = formatSyncSummary()
-    if err ~= nil and sync_summary ~= nil then
-        return err .. sync_summary
-    elseif sync_summary ~= nil then
-        return sync_summary
-    else
-        return err
-    end
+    return formatSyncSummary()
 end
 
 ---------------------
@@ -2232,13 +3037,20 @@ function API.checkItemData(progressCallBack)
 end
 
 function API.getDirAndPath(item)
-    if item == nil then
+    if item == nil or item.key == nil then
         return nil, nil
-    else
-        local dir = BaseUtil.joinPath(API.storage_dir, item.key)
-        local file = BaseUtil.joinPath(dir, item.data.filename)
-        return dir, file
     end
+    if API.storage_dir == nil or API.storage_dir == "" then
+        return nil, nil
+    end
+    local filename = item.data and item.data.filename
+    if filename == nil or filename == "" then
+        -- linked_file items often have path but empty filename
+        filename = API.basenameOfPath(item.data and item.data.path) or (item.key .. ".bin")
+    end
+    local dir = BaseUtil.joinPath(API.storage_dir, item.key)
+    local file = BaseUtil.joinPath(dir, filename)
+    return dir, file
 end
 
 function API.getItem(key)
@@ -2255,6 +3067,257 @@ function API.getItem(key)
         --print(result[1][1])
         return JSON.decode(result[1][1])
     end
+end
+
+-- Pull annotation children for one attachment from the Web API into the local DB.
+-- Also removes local DB rows for annotations no longer on the server (remote delete).
+-- known_sidecar_keys: optional set { [key]=true } of keys currently in the document sidecar.
+-- Returns: ok, remote_keys_set (or error string)
+function API.refreshAttachmentAnnotationsFromServer(parent_key, known_sidecar_keys)
+    if parent_key == nil or parent_key == "" or API.userLibraryURL == nil then
+        return false, "missing parent"
+    end
+    local e = API.verifyZoteroAccess()
+    if e ~= nil then
+        return false, e
+    end
+
+    -- Annotations are children of the *attachment*. Official endpoint is /children.
+    -- parentItem= is undocumented and often returns [] (HTTP 200) — that used to abort
+    -- the fallback, so new Zotero annotations never entered the local DB.
+    local function countAnnotationPayload(payload)
+        local n = 0
+        if type(payload) ~= "table" then
+            return 0
+        end
+        for _, item in pairs(payload) do
+            if type(item) == "table"
+                and item.key
+                and item.data
+                and item.data.itemType == "annotation"
+            then
+                n = n + 1
+            end
+        end
+        return n
+    end
+
+    local urls = {
+        API.userLibraryURL
+            .. "/items/"
+            .. tostring(parent_key)
+            .. "/children?itemType=annotation&limit=100",
+        API.userLibraryURL
+            .. "/items?itemType=annotation&parentItem="
+            .. tostring(parent_key)
+            .. "&limit=100",
+    }
+    local data, err_or_headers, used_url = nil, nil, nil
+    local best_data, best_headers, best_url, best_n = nil, nil, nil, -1
+    for _, url in ipairs(urls) do
+        local got, hdr_or_err = API.getZoteroData(url)
+        if got == nil then
+            logger.warn("Zotero: annotation pull failed for ", url, ": ", hdr_or_err)
+        else
+            local n = countAnnotationPayload(got)
+            logger.info(
+                ("Zotero: annotation pull %s → %d annotation(s)"):format(tostring(url), n)
+            )
+            if n > best_n then
+                best_data, best_headers, best_url, best_n = got, hdr_or_err, url, n
+            end
+            -- Prefer the first non-empty result (children is first)
+            if n > 0 then
+                break
+            end
+        end
+    end
+    data, err_or_headers, used_url = best_data, best_headers, best_url
+    if data == nil then
+        logger.warn("Zotero: refreshAttachmentAnnotationsFromServer failed: ", err_or_headers)
+        return false, err_or_headers
+    end
+    if type(data) ~= "table" then
+        return false, "bad children response"
+    end
+
+    local remote_keys = {}
+    local annotations_map = {}
+    local db = API.openDB()
+    local stmt_item = db:prepare(ZOTERO_DB_UPDATE_ITEM)
+    local stmt_data = db:prepare(ZOTERO_DB_UPDATE_ITEMDATA)
+    local stmt_del = db:prepare(ZOTERO_DB_DELETE_ITEM)
+
+    -- Use pairs (not ipairs): some JSON decoders yield string keys for arrays
+    local n_seen = 0
+    for _, item in pairs(data) do
+        if type(item) == "table" and item.key and item.data and item.data.itemType == "annotation" then
+            n_seen = n_seen + 1
+            -- Ensure we only keep annotations that belong to this attachment
+            local parent = item.data.parentItem
+            if parent and tostring(parent) ~= tostring(parent_key) then
+                -- skip foreign parent
+            elseif item.data.deleted then
+                stmt_del:reset():bind(item.key):step()
+            else
+                remote_keys[item.key] = true
+                annotations_map[item.key] = parent_key
+                local ver = item.version or 0
+                item.links = nil
+                item.library = nil
+                stmt_item:reset():bind(1, "annotation", item.key, ver):step()
+                stmt_data:reset():bind(item.key, JSON.encode(item)):step()
+            end
+        end
+    end
+    stmt_item:close()
+    stmt_data:close()
+    stmt_del:close()
+    stmt_del = nil
+
+    if next(annotations_map) ~= nil then
+        API.setAnnotations(annotations_map)
+        logger.info(
+            ("Zotero: upserted %d annotation link(s) for parent %s"):format(
+                (function()
+                    local n = 0
+                    for _ in pairs(annotations_map) do
+                        n = n + 1
+                    end
+                    return n
+                end)(),
+                tostring(parent_key)
+            )
+        )
+    end
+
+    -- Drop local annotation rows for this parent that are no longer on the server
+    local stmt_list = db:prepare(ZOTERO_GET_ITEM_ANNOTATIONS_INFO)
+    local local_keys = {}
+    local local_count = 0
+    local row = stmt_list:bind(parent_key):step()
+    while row ~= nil do
+        local_keys[row[1]] = true
+        local_count = local_count + 1
+        row = stmt_list:step(row)
+    end
+    stmt_list:close()
+
+    local n_remote = 0
+    for _ in pairs(remote_keys) do
+        n_remote = n_remote + 1
+    end
+
+    -- Safety: empty API result while we still have local anns — probe one key on server
+    -- before wiping (avoids nuking the library when parentItem filter misses).
+    -- Close all stmts first so nested fetchItemFromServer can open the DB safely.
+    if n_remote == 0 and local_count > 0 then
+        local sample = next(local_keys)
+        local still_remote = sample and API.fetchItemFromServer(sample) or nil
+        if still_remote and still_remote.data and still_remote.data.itemType == "annotation" then
+            logger.warn(
+                "Zotero: annotation pull returned 0 for parent "
+                    .. tostring(parent_key)
+                    .. " but "
+                    .. tostring(sample)
+                    .. " still exists on server — abort wipe"
+            )
+            return false, "parentItem filter missed annotations"
+        end
+    end
+
+    local to_remove = {}
+    for key, _ in pairs(local_keys) do
+        if not remote_keys[key] then
+            to_remove[key] = true
+        end
+    end
+    -- Sidecar keys not returned by API either (deleted remotely)
+    if type(known_sidecar_keys) == "table" then
+        for key, _ in pairs(known_sidecar_keys) do
+            if key and not remote_keys[key] and not to_remove[key] then
+                local still = API.getItem(key)
+                if still ~= nil then
+                    to_remove[key] = true
+                end
+            end
+        end
+    end
+    local removed = 0
+    stmt_del = db:prepare(ZOTERO_DB_DELETE_ITEM)
+    for key, _ in pairs(to_remove) do
+        logger.info("Zotero: remote delete — removing annotation " .. tostring(key) .. " from local DB")
+        stmt_del:reset():bind(key):step()
+        removed = removed + 1
+    end
+    stmt_del:close()
+
+    local lib_ver = nil
+    if type(err_or_headers) == "table" then
+        lib_ver = err_or_headers["last-modified-version"]
+            or err_or_headers["Last-Modified-Version"]
+    end
+    if lib_ver then
+        API.setUserLibraryVersion(lib_ver)
+    end
+
+    logger.info(
+        ("Zotero: refreshed attachment %s from server (seen=%d remote=%d removed=%d url=%s)"):format(
+            tostring(parent_key),
+            n_seen,
+            n_remote,
+            removed,
+            tostring(used_url)
+        )
+    )
+    return true, remote_keys
+end
+
+-- Fresh item from the Web API (avoids stale local version → 412 on update).
+function API.fetchItemFromServer(key)
+    if key == nil or key == "" or API.userLibraryURL == nil then
+        return nil
+    end
+    local e = API.verifyZoteroAccess()
+    if e ~= nil then
+        return nil
+    end
+    local req_headers = {}
+    for hk, hv in pairs(API.zoteroHeader or {}) do
+        req_headers[hk] = hv
+    end
+    local body = {}
+    local r, c, h = https.request({
+        method = "GET",
+        url = API.userLibraryURL .. "/items/" .. tostring(key),
+        headers = req_headers,
+        sink = ltn12.sink.table(body),
+        timeout = HTTP_TIMEOUT,
+    })
+    e = API.verifyResponse(r, c)
+    if e ~= nil then
+        logger.warn("Zotero: fetchItemFromServer failed: ", e)
+        return nil
+    end
+    local ok, item = pcall(JSON.decode, table.concat(body, ""))
+    if not ok or type(item) ~= "table" or item.key == nil then
+        return nil
+    end
+    pcall(function()
+        local db = API.openDB()
+        local ver = item.version or 0
+        local stmt_item = db:prepare(ZOTERO_DB_UPDATE_ITEM)
+        stmt_item:reset():bind(1, (item.data and item.data.itemType) or "annotation", key, ver):step()
+        stmt_item:close()
+        local stmt_data = db:prepare(ZOTERO_DB_UPDATE_ITEMDATA)
+        stmt_data:reset():bind(key, JSON.encode(item)):step()
+        stmt_data:close()
+    end)
+    local lib_ver = h and (h["last-modified-version"] or h["Last-Modified-Version"])
+    if lib_ver then
+        API.setUserLibraryVersion(lib_ver)
+    end
+    return item
 end
 
 function API.getItemWithAttachments(key)
@@ -2714,59 +3777,81 @@ end
 
 function API.syncAnnotations(progress_callback)
     local db = API.openDB()
-    local stmt = db:prepare(ZOTERO_GET_LOCAL_ATTACHMENT)
-    -- get list of all local pdf/epub files (according to db...)
-    local files, item_count = stmt:resultset()
-    logger.info("Zotero: Checking for new local annotations on " .. tostring(item_count) .. " attachments.")
+    -- All known attachments (not only syncedVersion>0) so linked files are included
+    local stmt = db:prepare(ZOTERO_LIST_ATTACHMENT_ITEMS)
+    local row = stmt:reset():step()
+    local keys = {}
+    while row ~= nil do
+        local ok, item = pcall(JSON.decode, row[1])
+        if
+            ok
+            and item
+            and item.data
+            and item.data.itemType == "attachment"
+            and API.isSupportedAttachmentLinkMode(item.data.linkMode)
+            and (
+                table_contains(SUPPORTED_MEDIA_TYPES, item.data.contentType)
+                or (item.data.path and (item.data.path:match("%.pdf$") or item.data.path:match("%.epub$")))
+            )
+        then
+            table.insert(keys, item.key)
+        end
+        row = stmt:step(row)
+    end
     stmt:close()
 
-    -- Track total errors across all files
+    local item_count = #keys
+    logger.info("Zotero: Checking annotations on " .. tostring(item_count) .. " attachments (incl. linked).")
+
     local total_upload_fails = 0
     local total_delete_fails = 0
     local total_update_fails = 0
 
-    if item_count then
-        local defaultColor = API.settings:readSetting("annotation_default_color")
-        Annotations.setDefaultColor(defaultColor)
-        for i = 1, item_count do
-            local key = files[1][i]
-            local db_ts = tonumber(files[3][i]) or 0
-            local item = API.getItem(key)
-            local file_path = nil
-            if item then
-                file_path = API.resolveAttachmentPath(item)
-                if file_path == nil then
-                    local _, path = API.getDirAndPath(item)
+    local defaultColor = API.settings:readSetting("annotation_default_color")
+    Annotations.setDefaultColor(defaultColor)
+
+    for i, key in ipairs(keys) do
+        local item = API.getItem(key)
+        local file_path = nil
+        if item then
+            file_path = API.resolveAttachmentPath(item)
+            if file_path == nil then
+                local ok_gp, dir, path = pcall(function()
+                    return API.getDirAndPath(item)
+                end)
+                if ok_gp then
                     file_path = path
                 end
             end
-            if file_path and file_exists(file_path) then
-                -- Only touch attachments whose sidecar changed since last annotation sync
-                local sidecarFile = nil
-                pcall(function()
-                    sidecarFile = DocSettings:findSidecarFile(file_path)
-                end)
-                local needs_sync = false
-                if sidecarFile then
-                    local file_ts = lfs.attributes(sidecarFile, "modification") or 0
-                    needs_sync = file_ts > db_ts
-                end
-                if needs_sync then
+        end
+        if file_path and file_exists(file_path) then
+            local sidecarFile = nil
+            pcall(function()
+                sidecarFile = DocSettings:findSidecarFile(file_path)
+            end)
+            -- Sync if sidecar exists (linked files often never had lastSync set)
+            if sidecarFile then
+                local syncedVersion, lastSync = API.getAttachmentVersion(key)
+                local db_ts = tonumber(lastSync) or 0
+                local file_ts = lfs.attributes(sidecarFile, "modification") or 0
+                -- Always sync if never tracked (linked files) or sidecar newer than last annotation sync
+                if (syncedVersion == nil or tonumber(syncedVersion) == 0 or db_ts == 0) or file_ts > db_ts then
                     local upload_fails, delete_fails, update_fails =
                         API.syncAnnotationsForAttachment(key, file_path)
                     total_upload_fails = total_upload_fails + (upload_fails or 0)
                     total_delete_fails = total_delete_fails + (delete_fails or 0)
                     total_update_fails = total_update_fails + (update_fails or 0)
+                    -- Ensure attachment is marked so future incremental syncs see it
+                    pcall(API.setAttachmentVersionByKey, key, item.version or 1)
                 end
             end
+        end
 
-            if progress_callback ~= nil and (i == 1 or i % 10 == 0 or i == item_count) then
-                progress_callback(string.format(_("Syncing annotations of file %i/%i"), i, item_count))
-            end
+        if progress_callback ~= nil and (i == 1 or i % 10 == 0 or i == item_count) then
+            progress_callback(string.format(_("Syncing annotations of file %i/%i"), i, item_count))
         end
     end
 
-    -- Return error counts (upload + update combined for backward compat of first return)
     return total_upload_fails + total_update_fails, total_delete_fails
 end
 
@@ -2783,12 +3868,77 @@ function API.syncAnnotationsForAttachment(key, file_path)
     local db = API.openDB()
     local stmt_ts = db:prepare(ZOTERO_SET_ATTACHMENT_LASTSYNC)
 
-    local doc_settings = DocSettings:open(file_path)
-    local sdr_annotations = doc_settings:readSetting("annotations", {})
+    local doc_settings_pre = DocSettings:open(file_path)
+    local sdr_before = doc_settings_pre:readSetting("annotations", {}) or {}
+    local keys_now = {}
+    for _, ann in ipairs(sdr_before) do
+        if ann.zoteroKey then
+            keys_now[ann.zoteroKey] = true
+        end
+    end
+    doc_settings_pre:close()
 
-    -- Get all annotations from database for this attachment
+    -- Detect local deletes via durable state file (NOT the KOReader sidecar).
+    local local_delete_set = API.noteLocalAnnotationDeletions(key, keys_now) or {}
+    local deleted_items = {}
+    for del_key, _ in pairs(local_delete_set) do
+        logger.info("Zotero: local delete candidate " .. tostring(del_key))
+    end
+
+    -- Refresh from Zotero API (remote adds / deletes / style). Must succeed for Z→K sync.
+    local remote_keys = {}
+    local refresh_ok, refresh_ret = API.refreshAttachmentAnnotationsFromServer(key, keys_now)
+    if refresh_ok and type(refresh_ret) == "table" then
+        remote_keys = refresh_ret
+    else
+        logger.warn("Zotero: server annotation pull failed: ", refresh_ret)
+    end
+
+    -- Pull remote annotations into sidecar (skip keys the user deleted locally)
+    local parent_item = API.getItem(key)
+    if parent_item then
+        local att_ok, att_err = pcall(
+            API.attachItemAnnotations,
+            parent_item,
+            nil,
+            file_path,
+            true,
+            local_delete_set
+        )
+        if not att_ok then
+            logger.err("Zotero: attachItemAnnotations crashed: ", att_err)
+        end
+    else
+        logger.warn("Zotero: no parent item for attachment " .. tostring(key))
+    end
+
+    -- After pull: strip local-deletes AND remote-deletes (keys with zoteroKey not on server)
+    local doc_settings = DocSettings:open(file_path)
+    local sdr_annotations = doc_settings:readSetting("annotations", {}) or {}
+    local stripped = false
+    for i = #sdr_annotations, 1, -1 do
+        local zk = sdr_annotations[i].zoteroKey
+        if zk then
+            local drop = local_delete_set[zk]
+            -- Only trust remote_keys when refresh succeeded (non-empty or empty both OK)
+            if refresh_ok and not remote_keys[zk] then
+                drop = true
+                logger.info("Zotero: strip sidecar annotation " .. zk .. " (gone on server)")
+            end
+            if drop then
+                table.remove(sdr_annotations, i)
+                stripped = true
+            end
+        end
+    end
+    if stripped then
+        doc_settings:saveSetting("annotations", sdr_annotations)
+        doc_settings:flush()
+    end
+
+    -- Resolve versions for delete API
     local stmt_get_annotations = db:prepare(ZOTERO_GET_ITEM_ANNOTATIONS_INFO)
-    local db_annotations = {} -- key -> {version, syncedVersion}
+    local db_annotations = {}
     local row = stmt_get_annotations:bind(key):step()
     while row ~= nil do
         db_annotations[row[1]] = {
@@ -2799,28 +3949,23 @@ function API.syncAnnotationsForAttachment(key, file_path)
     end
     stmt_get_annotations:close()
 
-    -- Build set of annotation keys currently in SDR
-    local sdr_keys = {}
-    for _, ann in ipairs(sdr_annotations or {}) do
-        if ann.zoteroKey then
-            sdr_keys[ann.zoteroKey] = true
+    for del_key, _ in pairs(local_delete_set) do
+        local info = db_annotations[del_key]
+        local ver = info and info.version
+        if ver == nil then
+            local it = API.getItem(del_key)
+            ver = it and it.version or 0
         end
-    end
-
-    -- Find deletions (annotations in DB but not in SDR)
-    local deleted_items = {}
-    for db_key, ann_info in pairs(db_annotations) do
-        if not sdr_keys[db_key] then
-            table.insert(deleted_items, { key = db_key, version = ann_info.version })
-            logger.info(
-                "Zotero: Detected deleted annotation: "
-                .. db_key
+        table.insert(deleted_items, { key = del_key, version = ver or 0 })
+        logger.info(
+            "Zotero: Detected deleted annotation: "
+                .. del_key
                 .. " (version: "
-                .. tostring(ann_info.version)
+                .. tostring(ver)
                 .. ")"
-            )
-        end
+        )
     end
+    doc_settings:close()
 
     local delete_fails = 0
     local successfully_deleted = {}
@@ -2848,6 +3993,42 @@ function API.syncAnnotationsForAttachment(key, file_path)
     )
     update_fails = update_fails or 0
 
+    -- Update durable sync state from final sidecar
+    local ds_final = DocSettings:open(file_path)
+    local sdr_final = ds_final:readSetting("annotations", {}) or {}
+    ds_final:close()
+    local success_set = {}
+    for _, okk in ipairs(successfully_deleted) do
+        success_set[okk] = true
+    end
+    local known_out = {}
+    local pending_out = {}
+    local seen = {}
+    for _, ann in ipairs(sdr_final) do
+        if ann.zoteroKey and not seen[ann.zoteroKey] then
+            table.insert(known_out, ann.zoteroKey)
+            seen[ann.zoteroKey] = true
+        end
+    end
+    -- Failed deletes stay pending (+ in known) for retry
+    for k, _ in pairs(local_delete_set) do
+        if not success_set[k] then
+            table.insert(pending_out, k)
+            if not seen[k] then
+                table.insert(known_out, k)
+                seen[k] = true
+            end
+        end
+    end
+    API.saveAnnotationSyncState(key, { known = known_out, pending_deletes = pending_out })
+    logger.info(
+        ("Zotero: annot state known=%d pending_deletes=%d deleted_ok=%d"):format(
+            #known_out,
+            #pending_out,
+            #successfully_deleted
+        )
+    )
+
     if upload_fails == 0 and delete_fails == 0 and update_fails == 0 then
         stmt_ts:reset():bind1(1, key):step()
     else
@@ -2857,14 +4038,64 @@ function API.syncAnnotationsForAttachment(key, file_path)
         if update_fails > 0 then
             logger.info("Zotero: Failed annotation updates: ", update_fails, update_err)
         end
+        if delete_fails > 0 then
+            logger.info("Zotero: Failed annotation deletes: ", delete_fails)
+        end
     end
     stmt_ts:close()
 
     return upload_fails, delete_fails, update_fails
 end
 
--- Create a whole range of items.
--- Returns an array with a status code per item
+-- Persist a newly created annotation item into the local SQLite catalogue so
+-- subsequent pull/delete logic does not treat the zoteroKey as orphaned.
+function API.upsertCreatedAnnotationItem(created, parent_key, request_payload)
+    if created == nil or created.key == nil then
+        return
+    end
+    local key = created.key
+    local version = created.version or API.getUserLibraryVersion() or 0
+    local item = created
+    if item.data == nil and request_payload ~= nil then
+        item = {
+            key = key,
+            version = version,
+            data = request_payload,
+        }
+        item.data.key = key
+        item.data.version = version
+        item.data.itemType = item.data.itemType or "annotation"
+    elseif item.data == nil then
+        item = {
+            key = key,
+            version = version,
+            data = {
+                itemType = "annotation",
+                key = key,
+                version = version,
+                parentItem = parent_key,
+            },
+        }
+    end
+    local ok, err = pcall(function()
+        local db = API.openDB()
+        local stmt_item = db:prepare(ZOTERO_DB_UPDATE_ITEM)
+        stmt_item:reset():bind(1, "annotation", key, version):step()
+        stmt_item:close()
+        local stmt_data = db:prepare(ZOTERO_DB_UPDATE_ITEMDATA)
+        stmt_data:reset():bind(key, JSON.encode(item)):step()
+        stmt_data:close()
+        if parent_key then
+            local stmt_ann = db:prepare(ZOTERO_UPSERT_ITEM_ANNOTATIONS)
+            stmt_ann:reset():bind(key, parent_key):step()
+            stmt_ann:close()
+        end
+    end)
+    if not ok then
+        logger.err("Zotero: upsertCreatedAnnotationItem failed for ", key, ": ", err)
+    end
+end
+
 function API.createItems(items)
     -- up to 50 items can be created with one request, see https://www.zotero.org/support/dev/web_api/v3/write_requests#creating_multiple_objects for details
     local API_MAX_ITEMS_PER_REQUEST = 50
@@ -2872,73 +4103,136 @@ function API.createItems(items)
     local total_requests = math.ceil(total_items / API_MAX_ITEMS_PER_REQUEST)
 
     local created_items = {}
-    for i = 1, total_items do
-        table.insert(created_items, nil)
-    end
 
     local e = API.verifyZoteroAccess()
     if e ~= nil then
         return created_items, e
     end
+    -- Avoid 412: refresh library version at most once per minute
+    local now = os.time()
+    if not API._lib_ver_refreshed_at or (now - API._lib_ver_refreshed_at) > 60 then
+        if pcall(API.refreshUserLibraryVersionFromServer) then
+            API._lib_ver_refreshed_at = now
+        end
+    end
+
     local headers = API.zoteroHeader
     local create_url = API.userLibraryURL .. "/items"
 
     local fails = {}
     for request_no = 1, total_requests do
         local request_items = {}
+        -- Lua arrays are 1-indexed; start_item is 0-based offset into the array
         local start_item = (request_no - 1) * API_MAX_ITEMS_PER_REQUEST
         local end_item = math.min(start_item + API_MAX_ITEMS_PER_REQUEST, total_items)
-        for i = start_item, end_item do
-            table.insert(request_items, items[i])
+        for i = start_item + 1, end_item do
+            local it = items[i]
+            if type(it) == "table" then
+                it._epubFullPosition = nil
+            end
+            table.insert(request_items, it)
         end
 
         local request_json = JSON.encode(request_items)
-        headers["If-Unmodified-Since-Version"] = API.getUserLibraryVersion()
-        local response = {}
-        logger.dbg(("Zotero: POST request to %s, body:\n%s"):format(create_url, request_json))
-        local r, c, response_headers = https.request({
-            method = "POST",
-            url = create_url,
-            headers = headers,
-            sink = ltn12.sink.table(response),
-            source = ltn12.source.string(request_json),
-        })
+        local function do_post()
+            local req_headers = {}
+            for hk, hv in pairs(headers) do
+                if string.lower(tostring(hk)) ~= "content-length" then
+                    req_headers[hk] = hv
+                end
+            end
+            req_headers["If-Unmodified-Since-Version"] = tostring(API.getUserLibraryVersion() or 0)
+            req_headers["Content-Type"] = "application/json"
+            local response = {}
+            logger.info(("Zotero: POST create %d item(s) (libVer=%s)"):format(
+                #request_items,
+                tostring(req_headers["If-Unmodified-Since-Version"])
+            ))
+            logger.dbg(("Zotero: POST body:\n%s"):format(request_json))
+            local r, c, response_headers = https.request({
+                method = "POST",
+                url = create_url,
+                headers = req_headers,
+                sink = ltn12.sink.table(response),
+                source = ltn12.source.string(request_json),
+                timeout = HTTP_TIMEOUT,
+            })
+            return r, c, response_headers, table.concat(response, "")
+        end
+
+        local r, c, response_headers, content = do_post()
         e = API.verifyResponse(r, c)
+        -- One retry after refreshing version on 412
+        if e ~= nil and tostring(c) == "412" then
+            logger.warn("Zotero: createItems 412 — refreshing library version and retrying once")
+            local found = content and content:match("found (%d+)")
+            if found then
+                API.setUserLibraryVersion(found)
+            else
+                pcall(API.refreshUserLibraryVersionFromServer)
+            end
+            r, c, response_headers, content = do_post()
+            e = API.verifyResponse(r, c)
+        end
         if e ~= nil then
+            logger.err("Zotero: createItems HTTP error: ", e, " body=", content)
             return created_items, e
         end
 
-        local content = table.concat(response, "")
         local ok, result = pcall(JSON.decode, content)
-        if not ok then
+        if not ok or type(result) ~= "table" then
+            logger.err("Zotero: createItems bad JSON: ", content)
             return created_items, "Error: failed to parse JSON in response to annotation creation request"
         end
 
-        -- Maybe don't update library version in here, becase we can't be sure that we have synced all items yet
-        -- Should run a library update after we have finished creating new items...
-
-        --local new_library_version = response_headers["last-modified-version"]
-        ----        print("New lib version: ", new_library_version)
-        --if new_library_version ~= nil then
-        --API.setUserLibraryVersion(new_library_version)
-        --else
-        --logger.err("Z: could not update library version from create request, got " .. tostring(new_library_version))
-        --end
-        --print(JSON.encode(result))
-        for k, v in pairs(result["successful"]) do
-            local index = start_item + tonumber(k) + 1
+        local n_ok, n_fail, n_unchanged = 0, 0, 0
+        for k, v in pairs(result["successful"] or {}) do
+            n_ok = n_ok + 1
+            local index = start_item + (tonumber(k) or 0) + 1
             created_items[index] = v
+            local parent_key = items[index] and items[index].parentItem
+            API.upsertCreatedAnnotationItem(v, parent_key, items[index])
         end
 
-        for k, v in pairs(result["unchanged"]) do
-            local index = start_item + tonumber(k) + 1
-            local zotero_key = v
+        for k, v in pairs(result["unchanged"] or {}) do
+            n_unchanged = n_unchanged + 1
+            local index = start_item + (tonumber(k) or 0) + 1
+            local zotero_key = type(v) == "table" and v.key or v
             created_items[index] = {
                 ["key"] = zotero_key,
+                ["version"] = type(v) == "table" and v.version or nil,
             }
+            local parent_key = items[index] and items[index].parentItem
+            API.upsertCreatedAnnotationItem(created_items[index], parent_key, items[index])
         end
-        for k, v in pairs(result["failed"]) do
+        for k, v in pairs(result["failed"] or {}) do
+            n_fail = n_fail + 1
+            logger.err("Zotero: create item failed [" .. tostring(k) .. "]: ", JSON.encode(v))
             table.insert(fails, v)
+        end
+
+        if n_ok == 0 and n_unchanged == 0 then
+            logger.err(
+                ("Zotero: createItems empty success (fail=%d) raw response: %s"):format(n_fail, content)
+            )
+            if n_fail == 0 and content ~= "" then
+                table.insert(fails, {
+                    code = 0,
+                    message = "empty successful/failed maps",
+                    raw = content,
+                })
+            end
+        else
+            logger.info(
+                ("Zotero: createItems batch ok=%d unchanged=%d fail=%d"):format(n_ok, n_unchanged, n_fail)
+            )
+        end
+
+        local new_library_version = response_headers and (
+            response_headers["last-modified-version"] or response_headers["Last-Modified-Version"]
+        )
+        if new_library_version ~= nil then
+            API.setUserLibraryVersion(new_library_version)
         end
     end
     if #fails > 0 then
@@ -2958,14 +4252,19 @@ function API.updateItems(items)
     local total_requests = math.ceil(total_items / API_MAX_ITEMS_PER_REQUEST)
 
     local updated_items = {}
-    for i = 1, total_items do
-        table.insert(updated_items, nil)
-    end
 
     local e = API.verifyZoteroAccess()
     if e ~= nil then
         return updated_items, e
     end
+    -- Library version: refresh at most once per minute (or on 412)
+    local now = os.time()
+    if not API._lib_ver_refreshed_at or (now - API._lib_ver_refreshed_at) > 60 then
+        if pcall(API.refreshUserLibraryVersionFromServer) then
+            API._lib_ver_refreshed_at = now
+        end
+    end
+
     local headers = API.zoteroHeader
     local update_url = API.userLibraryURL .. "/items"
 
@@ -2975,33 +4274,82 @@ function API.updateItems(items)
         local start_item = (request_no - 1) * API_MAX_ITEMS_PER_REQUEST
         local end_item = math.min(start_item + API_MAX_ITEMS_PER_REQUEST, total_items)
         for i = start_item + 1, end_item do
-            table.insert(request_items, items[i])
+            local it = items[i]
+            if type(it) == "table" then
+                it._epubFullPosition = nil
+                -- Use local/DB version first; fetch from server only on 412 retry
+                if it.key and (it.version == nil) then
+                    local remote = API.getItem(it.key)
+                    if remote and remote.version then
+                        it.version = remote.version
+                    end
+                end
+            end
+            table.insert(request_items, it)
         end
 
         local request_json = JSON.encode(request_items)
-        headers["If-Unmodified-Since-Version"] = API.getUserLibraryVersion()
-        local response = {}
-        logger.dbg(("Zotero: POST update to %s, body:\n%s"):format(update_url, request_json))
-        local r, c, response_headers = https.request({
-            method = "POST",
-            url = update_url,
-            headers = headers,
-            sink = ltn12.sink.table(response),
-            source = ltn12.source.string(request_json),
-        })
+        local function do_post(json_body)
+            local req_headers = {}
+            for hk, hv in pairs(headers) do
+                if string.lower(tostring(hk)) ~= "content-length" then
+                    req_headers[hk] = hv
+                end
+            end
+            req_headers["If-Unmodified-Since-Version"] = tostring(API.getUserLibraryVersion() or 0)
+            req_headers["Content-Type"] = "application/json"
+            local response = {}
+            logger.info(("Zotero: POST update %d item(s) (libVer=%s)"):format(
+                #request_items,
+                tostring(req_headers["If-Unmodified-Since-Version"])
+            ))
+            logger.dbg(("Zotero: POST update body:\n%s"):format(json_body))
+            local r, c, response_headers = https.request({
+                method = "POST",
+                url = update_url,
+                headers = req_headers,
+                sink = ltn12.sink.table(response),
+                source = ltn12.source.string(json_body),
+                timeout = HTTP_TIMEOUT,
+            })
+            return r, c, response_headers, table.concat(response, "")
+        end
+
+        local r, c, response_headers, content = do_post(request_json)
         e = API.verifyResponse(r, c)
+        if e ~= nil and tostring(c) == "412" then
+            logger.warn("Zotero: updateItems 412 — refreshing versions and retrying once")
+            local found = content and content:match("found (%d+)")
+            if found then
+                API.setUserLibraryVersion(found)
+            else
+                pcall(API.refreshUserLibraryVersionFromServer)
+            end
+            for _, it in ipairs(request_items) do
+                if it.key then
+                    local remote = API.fetchItemFromServer(it.key)
+                    if remote and remote.version then
+                        it.version = remote.version
+                    end
+                end
+            end
+            request_json = JSON.encode(request_items)
+            r, c, response_headers, content = do_post(request_json)
+            e = API.verifyResponse(r, c)
+        end
         if e ~= nil then
+            logger.err("Zotero: updateItems HTTP error: ", e, " body=", content)
             return updated_items, e
         end
 
-        local content = table.concat(response, "")
         local ok, result = pcall(JSON.decode, content)
-        if not ok then
+        if not ok or type(result) ~= "table" then
+            logger.err("Zotero: updateItems bad JSON: ", content)
             return updated_items, "Error: failed to parse JSON in response to annotation update request"
         end
 
         for k, v in pairs(result["successful"] or {}) do
-            local index = start_item + tonumber(k) + 1
+            local index = start_item + (tonumber(k) or 0) + 1
             updated_items[index] = v
             if v.key and v.data then
                 local db = API.openDB()
@@ -3011,13 +4359,59 @@ function API.updateItems(items)
             end
         end
         for k, v in pairs(result["unchanged"] or {}) do
-            local index = start_item + tonumber(k) + 1
-            updated_items[index] = { ["key"] = v }
+            local index = start_item + (tonumber(k) or 0) + 1
+            updated_items[index] = { ["key"] = type(v) == "table" and v.key or v }
         end
+        -- Retry items that failed with per-item 412 (stale version)
+        local retry_items = {}
         for k, v in pairs(result["failed"] or {}) do
-            table.insert(fails, v)
+            logger.err("Zotero: update item failed [" .. tostring(k) .. "]: ", JSON.encode(v))
+            local idx = start_item + (tonumber(k) or 0) + 1
+            local it = request_items[(tonumber(k) or 0) + 1]
+            if type(v) == "table" and tonumber(v.code) == 412 and it and it.key then
+                local remote = API.fetchItemFromServer(it.key)
+                if remote and remote.version then
+                    it.version = remote.version
+                    table.insert(retry_items, it)
+                else
+                    table.insert(fails, v)
+                end
+            else
+                table.insert(fails, v)
+            end
         end
-        local new_library_version = response_headers and response_headers["last-modified-version"]
+        if #retry_items > 0 then
+            logger.warn(("Zotero: retrying %d item update(s) after per-item 412"):format(#retry_items))
+            local retry_json = JSON.encode(retry_items)
+            local rr, rc, rh, rcontent = do_post(retry_json)
+            local re = API.verifyResponse(rr, rc)
+            if re == nil then
+                local rok, rresult = pcall(JSON.decode, rcontent)
+                if rok and type(rresult) == "table" then
+                    for k, v in pairs(rresult["successful"] or {}) do
+                        table.insert(updated_items, v)
+                        if v.key and v.data then
+                            local db = API.openDB()
+                            local stmt2 = db:prepare(ZOTERO_DB_UPDATE_ITEMDATA)
+                            stmt2:reset():bind(v.key, JSON.encode(v)):step()
+                            stmt2:close()
+                        end
+                    end
+                    for _, v in pairs(rresult["failed"] or {}) do
+                        table.insert(fails, v)
+                    end
+                    local new_lib = rh and (rh["last-modified-version"] or rh["Last-Modified-Version"])
+                    if new_lib then
+                        API.setUserLibraryVersion(new_lib)
+                    end
+                end
+            else
+                logger.err("Zotero: updateItems retry HTTP error: ", re)
+            end
+        end
+        local new_library_version = response_headers and (
+            response_headers["last-modified-version"] or response_headers["Last-Modified-Version"]
+        )
         if new_library_version ~= nil then
             API.setUserLibraryVersion(new_library_version)
         end
@@ -3083,39 +4477,54 @@ function API.deleteItems(item_keys)
             headers = headers,
         })
 
-        if c == 204 then
-            -- Success - item deleted
+        local function mark_ok()
             logger.info("Zotero: Successfully deleted item " .. key)
             table.insert(successful_deletes, key)
-            -- Update library version from response
-            local new_library_version = response_headers["last-modified-version"]
+            local new_library_version = response_headers
+                and (response_headers["last-modified-version"] or response_headers["Last-Modified-Version"])
             if new_library_version ~= nil then
                 API.setUserLibraryVersion(new_library_version)
             end
+        end
+
+        if c == 204 then
+            mark_ok()
         elseif c == 404 then
-            -- Item not found - consider it already deleted
             logger.info("Zotero: Item " .. key .. " not found on server (already deleted?)")
             table.insert(successful_deletes, key)
-        elseif c == 409 then
-            -- Item has been modified since specified version
-            logger.err(
-                "Zotero: Cannot delete item "
-                .. key
-                .. " - version conflict (item version: "
-                .. tostring(item_version)
-                .. ")"
+        elseif c == 409 or c == 412 then
+            -- Stale version — refresh from server and retry once
+            logger.warn(
+                ("Zotero: delete %s got HTTP %s (ver=%s) — refreshing and retrying"):format(
+                    key,
+                    tostring(c),
+                    tostring(item_version)
+                )
             )
-            failed_count = failed_count + 1
-        elseif c == 412 then
-            -- Precondition failed - library has been modified
-            logger.err(
-                "Zotero: Cannot delete item "
-                .. key
-                .. " - library modified (expected version: "
-                .. tostring(item_version)
-                .. ")"
-            )
-            failed_count = failed_count + 1
+            local remote = API.fetchItemFromServer(key)
+            if remote == nil then
+                -- Gone on server
+                table.insert(successful_deletes, key)
+            else
+                headers["If-Unmodified-Since-Version"] = tostring(remote.version or item_version)
+                local r2, c2, h2 = https.request({
+                    method = "DELETE",
+                    url = delete_url,
+                    headers = headers,
+                })
+                response_headers = h2
+                if c2 == 204 or c2 == 404 then
+                    mark_ok()
+                else
+                    logger.err(
+                        "Zotero: delete retry failed for "
+                            .. key
+                            .. " - HTTP "
+                            .. tostring(c2)
+                    )
+                    failed_count = failed_count + 1
+                end
+            end
         else
             logger.err("Zotero: Failed to delete item " .. key .. " - HTTP " .. tostring(c))
             failed_count = failed_count + 1
@@ -3254,22 +4663,187 @@ function API.getAttachmentInfo(item, filePathOverride)
     customSettings:flushCustomMetadata(filePath)
 end
 
--- Attach Zotero annotations for specified item
--- by adding them to document settings
-function API.attachItemAnnotations(item, annotation_callback, filePathOverride)
-    local contentType = item.data and item.data.contentType
+-- Count annotations in itemAnnotations for an attachment key.
+function API.countAttachmentAnnotations(attachment_key)
+    if attachment_key == nil then
+        return 0
+    end
+    local count = 0
+    local ok = pcall(function()
+        local db = API.openDB()
+        local stmt = db:prepare(ZOTERO_GET_ITEM_ANNOTATIONS_INFO)
+        local row = stmt:bind(attachment_key):step()
+        while row ~= nil do
+            count = count + 1
+            row = stmt:step(row)
+        end
+        stmt:close()
+    end)
+    if not ok then
+        return 0
+    end
+    return count
+end
+
+-- Count sidecar annotations that already carry a zoteroKey.
+function API.countSidecarZoteroAnnotations(file_path)
+    if file_path == nil or not file_exists(file_path) then
+        return 0
+    end
+    local count = 0
+    pcall(function()
+        local docSettings = DocSettings:open(file_path)
+        local anns = docSettings:readSetting("annotations", {}) or {}
+        for _, ann in ipairs(anns) do
+            if ann.zoteroKey then
+                count = count + 1
+            end
+        end
+        docSettings:close()
+    end)
+    return count
+end
+
+-- Prefer more precise EPUB XPointers (text().N) over coarse DocFragment/body stubs.
+local function epubXpPrecision(xp)
+    if type(xp) == "table" and type(xp.xpointer) == "string" then
+        xp = xp.xpointer
+    end
+    if type(xp) ~= "string" or not xp:find("DocFragment", 1, true) then
+        return 0
+    end
+    if xp:find("text()", 1, true) then
+        return 3
+    end
+    if xp:match("^/body/DocFragment%[%d+%]/body$") then
+        return 1
+    end
+    return 2
+end
+
+-- Preserve KOReader geometry (especially EPUB XPointer strings) when applying a Zotero item.
+local function preserveLocalGeometry(converted, prev)
+    if prev == nil then
+        return
+    end
+    if prev.zoteroDestination then
+        converted.zoteroDestination = prev.zoteroDestination
+    end
+    -- Keep the more precise XPointers (remote convert often only has DocFragment/body)
+    if epubXpPrecision(prev.page) >= epubXpPrecision(converted.page) and type(prev.page) == "string" then
+        converted.page = prev.page
+    end
+    if epubXpPrecision(prev.pos0) >= epubXpPrecision(converted.pos0) and prev.pos0 ~= nil then
+        converted.pos0 = prev.pos0
+    end
+    if epubXpPrecision(prev.pos1) >= epubXpPrecision(converted.pos1) and prev.pos1 ~= nil then
+        converted.pos1 = prev.pos1
+    end
+    if prev.pageno ~= nil then
+        converted.pageno = prev.pageno
+    end
+    if prev.pboxes and #prev.pboxes > 0 then
+        converted.pboxes = prev.pboxes
+    end
+    if prev.chapter then
+        converted.chapter = prev.chapter
+    end
+    -- Never clobber a deliberate gray/black e-ink underline with a yellow fallback from a bad map
+    local prev_c = string.lower(tostring(prev.color or ""))
+    local new_c = string.lower(tostring(converted.color or ""))
+    if (prev_c == "gray" or prev_c == "grey" or prev_c == "black") and new_c == "yellow" then
+        converted.color = prev_c == "black" and "gray" or prev.color
+    end
+    if prev.drawer and converted.drawer and prev.drawer ~= converted.drawer then
+        -- Keep local drawer when remote only differs because of type fallback noise
+        if prev.drawer == "underscore" and converted.drawer == "lighten" then
+            local match = converted._matchItem
+            local remote_type = match and match.data and match.data.annotationType
+            if remote_type == nil or remote_type == "" then
+                converted.drawer = prev.drawer
+            end
+        end
+    end
+end
+
+local function applyZoteroAnnotationToSidecar(koreaderAnnotations, localZotAnn, key, itemInfo, converted)
+    if converted == nil then
+        return false
+    end
+    -- Stash then ALWAYS drop: persisting _matchItem in the sidecar breaks KOReader drawing
+    -- (nested Zotero item tables) and was left behind on the update-existing path.
+    local match_item = converted._matchItem
+    converted._matchItem = nil
+    if localZotAnn[key] ~= nil then
+        local prev = koreaderAnnotations[localZotAnn[key].position]
+        local remote_newer = (tonumber(localZotAnn[key].version) or 0) < (tonumber(itemInfo.version) or 0)
+        local style_diff = prev ~= nil
+            and (
+                tostring(prev.color or "") ~= tostring(converted.color or "")
+                or tostring(prev.drawer or "") ~= tostring(converted.drawer or "")
+                or tostring(prev.note or "") ~= tostring(converted.note or "")
+                or tostring(prev.text or "") ~= tostring(converted.text or "")
+            )
+        if remote_newer or style_diff then
+            preserveLocalGeometry(converted, prev)
+            koreaderAnnotations[localZotAnn[key].position] = converted
+            return true
+        end
+        return false
+    end
+    -- Merge into a matching local annotation (same page+text) to avoid duplicates
+    local match_idx = nil
+    if match_item then
+        match_idx = Annotations.findMatchingLocalAnnotation(koreaderAnnotations, match_item)
+    end
+    if match_idx then
+        local prev = koreaderAnnotations[match_idx]
+        converted.zoteroDestination = prev.zoteroDestination
+            or converted.zoteroDestination
+            or Annotations.DEST_BOTH
+        preserveLocalGeometry(converted, prev)
+        koreaderAnnotations[match_idx] = converted
+        localZotAnn[key] = { position = match_idx, version = itemInfo.version }
+        return true
+    end
+    table.insert(koreaderAnnotations, converted)
+    localZotAnn[key] = { position = #koreaderAnnotations, version = itemInfo.version }
+    return true
+end
+
+-- Attach Zotero annotations for specified item by adding them to document settings.
+-- skip_keys: optional set { [zoteroKey]=true } of annotations the user deleted locally
+--            (must not be re-injected from a remote pull).
+-- Returns nil on success, or an error/warning string.
+function API.attachItemAnnotations(item, annotation_callback, filePathOverride, force, skip_keys)
+    if item == nil or item.data == nil then
+        return "Error: invalid item"
+    end
+    skip_keys = skip_keys or {}
+
+    local filePath = filePathOverride
+    if filePath == nil or filePath == "" then
+        filePath = API.resolveAttachmentPath(item)
+    end
+    if filePath == nil or filePath == "" then
+        local ok, _, path = pcall(function()
+            return API.getDirAndPath(item)
+        end)
+        if ok then
+            filePath = path
+        end
+    end
+
+    local contentType = item.data.contentType
     local is_pdf = contentType == "application/pdf"
+        or (filePath and string.lower(filePath):match("%.pdf$") ~= nil)
     local is_epub = contentType == "application/epub+zip"
+        or (filePath and string.lower(filePath):match("%.epub$") ~= nil)
     if not is_pdf and not is_epub then
         return "Warning: Can only sync annotations for PDF and EPUB files"
     end
 
     local itemKey = item.key
-    local _, filePath = API.getDirAndPath(item)
-    if filePathOverride and filePathOverride ~= "" then
-        filePath = filePathOverride
-    end
-
     if filePath == nil then
         return "Error: could not find item"
     end
@@ -3277,20 +4851,30 @@ function API.attachItemAnnotations(item, annotation_callback, filePathOverride)
         return "Error: file does not exist at " .. tostring(filePath)
     end
 
-    -- (Relevant) Zotero annotation keys (currently only for highlights)
     local zoteroItems = {}
     local zotCount = 0
 
     local docSettings = DocSettings:open(filePath)
     local lastSyncedLibVersion = docSettings:readSetting("zoteroLibVersion", 0)
     local libVersion = API.getUserLibraryVersion()
+    local sidecar_zot = 0
+    local anns_preview = docSettings:readSetting("annotations", {}) or {}
+    for _, ann in ipairs(anns_preview) do
+        if ann.zoteroKey then
+            sidecar_zot = sidecar_zot + 1
+        end
+    end
+    local db_zot = API.countAttachmentAnnotations(itemKey)
+    -- Re-pull when forced, library newer, sidecar missing remote anns, OR sidecar still
+    -- has anns deleted from the local DB (remote delete after library/API refresh).
+    local needs_pull = force
+        or (lastSyncedLibVersion < libVersion)
+        or (db_zot > sidecar_zot)
+        or (sidecar_zot > db_zot)
 
-    if lastSyncedLibVersion < libVersion then
-        --print("Checking item\'s annotations in Zotero database")
-        -- Scan zotero annotations.
+    if needs_pull then
         local db = API.openDB()
         local stmt_get_ItemAnnotationInfo = db:prepare(ZOTERO_GET_ITEM_ANNOTATIONS_INFO)
-
         local row = stmt_get_ItemAnnotationInfo:bind(itemKey):step()
         while row ~= nil do
             local key = row[1]
@@ -3300,125 +4884,265 @@ function API.attachItemAnnotations(item, annotation_callback, filePathOverride)
         end
         stmt_get_ItemAnnotationInfo:close()
     end
-    if zotCount > 0 then
-        -- Find all the annotations that KOReader knows about from DocSettings
-        local koreaderAnnotations = docSettings:readSetting("annotations", {})
-        logger.dbg("Zotero: " .. #koreaderAnnotations .. " KOReader annotations in sidecar")
+
+    local applied = 0
+    local failed = 0
+
+    -- Always load sidecar when pulling: even with zotCount=0 we must remove
+    -- annotations deleted remotely (otherwise they linger / corrupt rolling format).
+    if needs_pull then
+        local koreaderAnnotations = docSettings:readSetting("annotations", {}) or {}
+        logger.dbg("Zotero: " .. #koreaderAnnotations .. " KOReader annotations in sidecar, zotCount=" .. tostring(zotCount))
 
         local localZotAnn = {}
-        -- If there are locally stored KOReader annotations, check them to identify Zotero annotations
         local annotationsToRemove = {}
         for idx, ann in ipairs(koreaderAnnotations) do
             if ann.zoteroKey ~= nil then
-                if zoteroItems[ann.zoteroKey] ~= nil then
-                    localZotAnn[ann.zoteroKey] = { ["position"] = idx, ["version"] = ann.zoteroVersion }
-                else
-                    -- Check if the annotation still exists in the database
-                    local item = API.getItem(ann.zoteroKey)
-                    if item == nil then
-                        logger.info(
-                            "Zotero: DELETION BUG FIX: Delete local Zotero annotation "
+                if skip_keys[ann.zoteroKey] then
+                    logger.info(
+                        "Zotero: Remove local annotation "
                             .. ann.zoteroKey
-                            .. " (not found in database)"
+                            .. " (deleted locally, skip re-pull)"
+                    )
+                    table.insert(annotationsToRemove, idx)
+                elseif zoteroItems[ann.zoteroKey] ~= nil then
+                    localZotAnn[ann.zoteroKey] = {
+                        ["position"] = idx,
+                        ["version"] = ann.zoteroVersion,
+                    }
+                else
+                    -- Only remove if the item is truly gone from the whole DB
+                    local gone = API.getItem(ann.zoteroKey)
+                    if gone == nil then
+                        logger.info(
+                            "Zotero: Remove local annotation "
+                                .. ann.zoteroKey
+                                .. " (deleted remotely)"
                         )
                         table.insert(annotationsToRemove, idx)
-                    elseif ann.zoteroVersion < libVersion then
-                        logger.info("Zotero: Delete local Zotero annotation " .. ann.zoteroKey .. " (version outdated)")
-                        table.insert(annotationsToRemove, idx)
                     end
+                    -- Do NOT remove merely because version < libVersion (that caused re-uploads)
                 end
             end
         end
-
-        -- Remove annotations in reverse order to maintain correct indices
+        local removed = #annotationsToRemove
         for i = #annotationsToRemove, 1, -1 do
             table.remove(koreaderAnnotations, annotationsToRemove[i])
         end
-
-        if is_pdf then
-            -- Build a list of pages that need BBOX data
-            logger.info("Zotero: Building list of pages that need BBOX data")
-            local pages_needed = {}
-            for key, itemInfo in pairs(zoteroItems) do
-                local ann_item = API.getItem(key)
-                if ann_item and ann_item.data and ann_item.data.annotationPosition then
-                    local pos = JSON.decode(ann_item.data.annotationPosition)
-                    if pos.pageIndex ~= nil then
-                        local page = pos.pageIndex + 1
-                        pages_needed[page] = true
-                        logger.info("Zotero: Page " .. page .. " needs BBOX data for annotation " .. key)
-                    end
-                end
+        -- Rebuild localZotAnn positions after removals
+        localZotAnn = {}
+        for idx, ann in ipairs(koreaderAnnotations) do
+            if ann.zoteroKey and zoteroItems[ann.zoteroKey] then
+                localZotAnn[ann.zoteroKey] = {
+                    position = idx,
+                    version = ann.zoteroVersion,
+                }
             end
+        end
 
-            -- Get BBOX data for all pages that have annotations
-            logger.info("Zotero: Getting BBOX dimensions for pages: " .. JSON.encode(pages_needed))
-            local page_dimensions
-            local bbox_ok, bbox_err = pcall(function()
-                page_dimensions = Annotations.getPageDimensions(filePath, pages_needed)
+        -- Repair EPUB annotations: numeric page (paging) + coarse DocFragment/body
+        -- (invisible). Reverse real CFIs from Zotero into precise xpointers.
+        if is_epub then
+            local EpubCfi = nil
+            pcall(function()
+                EpubCfi = require("epub_cfi")
             end)
-            if not bbox_ok then
-                logger.err("Zotero: getPageDimensions crashed for " .. filePath .. ": " .. tostring(bbox_err))
-                return "Error: Could not get page dimensions"
-            end
-            if page_dimensions == nil then
-                logger.err("Zotero: Could not get page dimensions for " .. filePath)
-                return "Error: Could not get page dimensions"
-            end
-
-            -- Convert Zotero annotations to KOReader format using per-page BBOX
-            for key, itemInfo in pairs(zoteroItems) do
-                local ann_item = API.getItem(key)
-                if ann_item and ann_item.data and ann_item.data.annotationPosition then
-                    local pos = JSON.decode(ann_item.data.annotationPosition)
-                    if pos.pageIndex ~= nil and pos.rects and #pos.rects > 0 then
-                        local page = pos.pageIndex + 1
-                        local page_bbox = page_dimensions[page]
-
-                        if page_bbox == nil then
-                            logger.err("Zotero: No BBOX data for page " .. page .. " of annotation " .. key .. ", skipping")
-                        else
-                            logger.info("Zotero: Converting annotation " .. key .. " on page " .. page)
-                            if localZotAnn[key] == nil then
-                                table.insert(koreaderAnnotations, Annotations.convertZoteroToKOReader(ann_item, page_bbox))
-                            elseif localZotAnn[key].version < itemInfo.version then
-                                logger.info("Zotero: Updating annotation " .. key)
-                                koreaderAnnotations[localZotAnn[key].position] = Annotations.convertZoteroToKOReader(ann_item,
-                                    page_bbox)
-                            end
+            for _, ann in ipairs(koreaderAnnotations) do
+                local xp0 = nil
+                if type(ann.pos0) == "string" and ann.pos0:find("DocFragment", 1, true) then
+                    xp0 = ann.pos0
+                elseif type(ann.pos0) == "table" and type(ann.pos0.xpointer) == "string" then
+                    xp0 = ann.pos0.xpointer
+                elseif type(ann.page) == "string" and ann.page:find("DocFragment", 1, true) then
+                    xp0 = ann.page
+                end
+                local xp1 = nil
+                if type(ann.pos1) == "string" and ann.pos1:find("DocFragment", 1, true) then
+                    xp1 = ann.pos1
+                elseif type(ann.pos1) == "table" and type(ann.pos1.xpointer) == "string" then
+                    xp1 = ann.pos1.xpointer
+                end
+                local cfi_val = ann.zoteroCfi
+                if type(ann.zoteroAnnotationPosition) == "string" then
+                    local ok_p, pos = pcall(JSON.decode, ann.zoteroAnnotationPosition)
+                    if ok_p and type(pos) == "table" then
+                        if type(pos.koreaderPos0) == "string" and pos.koreaderPos0:find("text()", 1, true) then
+                            xp0 = pos.koreaderPos0
                         end
+                        if type(pos.koreaderPos1) == "string" and pos.koreaderPos1:find("text()", 1, true) then
+                            xp1 = pos.koreaderPos1
+                        end
+                        cfi_val = cfi_val or pos.value
                     end
                 end
+                if EpubCfi and EpubCfi.normalizeCfi and cfi_val then
+                    cfi_val = EpubCfi.normalizeCfi(cfi_val) or cfi_val
+                    ann.zoteroCfi = cfi_val
+                end
+                local coarse = not (type(xp0) == "string" and xp0:find("text()", 1, true))
+                -- Also repair page="1" / page=1 (no DocFragment) which crash CRE on open
+                local page_bad = type(ann.page) ~= "string"
+                    or not tostring(ann.page):find("DocFragment", 1, true)
+                if (coarse or page_bad) and EpubCfi and cfi_val then
+                    local r0, r1 = EpubCfi.toKOReaderPositions(tostring(cfi_val), filePath)
+                    if r0 then
+                        xp0, xp1 = r0, r1 or r0
+                        coarse = false
+                        page_bad = false
+                    end
+                end
+                if (not xp0 or page_bad) and cfi_val then
+                    local frag = Annotations.docFragmentFromEpubCfi(cfi_val)
+                    if frag then
+                        xp0 = xp0 or string.format("/body/DocFragment[%d]/body", frag)
+                    end
+                end
+                if not xp0 and type(ann.page) == "number" then
+                    xp0 = string.format("/body/DocFragment[%d]/body", ann.page)
+                elseif not xp0 and type(ann.page) == "string" and ann.page:match("^%d+$") then
+                    xp0 = string.format("/body/DocFragment[%d]/body", tonumber(ann.page) or 1)
+                end
+                if xp0 then
+                    ann.page = xp0
+                    ann.pos0 = xp0
+                    ann.pos1 = xp1 or xp0
+                end
             end
-            docSettings:saveSetting("page_bboxes", page_dimensions)
-        else
-            -- EPUB / non-PDF: text + comment sync with best-effort position
-            for key, itemInfo in pairs(zoteroItems) do
+            -- Clear stale paging/rolling copies so KOReader stays on `annotations`
+            if docSettings.delSetting then
+                docSettings:delSetting("annotations_paging")
+                docSettings:delSetting("annotations_rolling")
+            else
+                docSettings:saveSetting("annotations_paging", nil)
+                docSettings:saveSetting("annotations_rolling", nil)
+            end
+        end
+
+        local page_dimensions = {}
+        if is_pdf and zotCount > 0 then
+            local pages_needed = {}
+            for key, _ in pairs(zoteroItems) do
                 local ann_item = API.getItem(key)
                 if ann_item and ann_item.data then
-                    if localZotAnn[key] == nil then
-                        table.insert(koreaderAnnotations, Annotations.convertZoteroToKOReaderEpub(ann_item))
-                    elseif localZotAnn[key].version < itemInfo.version then
-                        koreaderAnnotations[localZotAnn[key].position] =
-                            Annotations.convertZoteroToKOReaderEpub(ann_item)
+                    local page = nil
+                    if ann_item.data.annotationPosition then
+                        local ok_p, pos = pcall(JSON.decode, ann_item.data.annotationPosition)
+                        if ok_p and pos and pos.pageIndex ~= nil then
+                            page = pos.pageIndex + 1
+                        end
                     end
+                    if page == nil and ann_item.data.annotationPageLabel then
+                        page = tonumber(ann_item.data.annotationPageLabel)
+                    end
+                    if page then
+                        pages_needed[page] = true
+                    end
+                end
+            end
+            local bbox_ok, bbox_err = pcall(function()
+                page_dimensions = Annotations.getPageDimensions(filePath, pages_needed) or {}
+            end)
+            if not bbox_ok then
+                logger.err("Zotero: getPageDimensions crashed: ", bbox_err)
+                page_dimensions = {}
+            end
+            docSettings:saveSetting("page_bboxes", page_dimensions)
+        end
+
+        for key, itemInfo in pairs(zoteroItems) do
+            if skip_keys[key] then
+                logger.info("Zotero: skip re-pull of locally deleted annotation " .. tostring(key))
+            else
+                local ann_item = API.getItem(key)
+                if ann_item and ann_item.data then
+                    local converted
+                    if is_pdf then
+                        local page = 1
+                        if ann_item.data.annotationPosition then
+                            local ok_p, pos = pcall(JSON.decode, ann_item.data.annotationPosition)
+                            if ok_p and pos and pos.pageIndex ~= nil then
+                                page = pos.pageIndex + 1
+                            end
+                        end
+                        local page_bbox = page_dimensions[page] or Annotations.fallbackPageBbox()
+                        local ok_c, result = pcall(Annotations.convertZoteroToKOReader, ann_item, page_bbox)
+                        if ok_c then
+                            converted = result
+                        else
+                            logger.err("Zotero: convert PDF annotation failed ", key, ": ", result)
+                            failed = failed + 1
+                        end
+                    else
+                        local ok_c, result = pcall(Annotations.convertZoteroToKOReaderEpub, ann_item, filePath)
+                        if ok_c then
+                            converted = result
+                        else
+                            logger.err("Zotero: convert EPUB annotation failed ", key, ": ", result)
+                            failed = failed + 1
+                        end
+                    end
+                    if converted then
+                        converted._matchItem = ann_item
+                        if applyZoteroAnnotationToSidecar(
+                            koreaderAnnotations,
+                            localZotAnn,
+                            key,
+                            itemInfo,
+                            converted
+                        )
+                        then
+                            applied = applied + 1
+                        end
+                    end
+                else
+                    failed = failed + 1
                 end
             end
         end
 
-        -- Use zoteroSortIndex for sorting.
-        local comparator = function(a, b)
-            return (tostring(a.page or "") .. (a.zoteroSortIndex or "") < tostring(b.page or "") .. (b.zoteroSortIndex or ""))
-        end
-        table.sort(koreaderAnnotations, comparator)
-
+        table.sort(koreaderAnnotations, function(a, b)
+            return (tostring(a.page or "") .. (a.zoteroSortIndex or ""))
+                < (tostring(b.page or "") .. (b.zoteroSortIndex or ""))
+        end)
         docSettings:saveSetting("annotations", koreaderAnnotations)
-    else
-        logger.info("Zotero: item annotations up to date.")
+        logger.info(
+            ("Zotero: attach done for %s (zotCount=%d applied=%d failed=%d removed=%d sidecar=%d)"):format(
+                tostring(itemKey),
+                zotCount,
+                applied,
+                failed,
+                removed,
+                #koreaderAnnotations
+            )
+        )
+        if zotCount == 0 and removed == 0 then
+            logger.info("Zotero: no annotations to attach (zotCount=0)")
+        elseif zotCount == 0 and removed > 0 then
+            logger.info("Zotero: removed " .. tostring(removed) .. " remotely deleted annotation(s)")
+        end
     end
-    -- Write new lib version to sdr file
-    docSettings:saveSetting("zoteroLibVersion", libVersion)
+
+    -- Only advance sidecar lib version when pull succeeded reasonably
+    if failed == 0 or (zotCount > 0 and applied > 0 and failed < zotCount) then
+        if needs_pull then
+            docSettings:saveSetting("zoteroLibVersion", libVersion)
+        end
+    else
+        logger.warn(
+            "Zotero: not advancing zoteroLibVersion (applied="
+                .. tostring(applied)
+                .. " failed="
+                .. tostring(failed)
+                .. " zotCount="
+                .. tostring(zotCount)
+                .. ")"
+        )
+    end
     docSettings:flush()
+    if failed > 0 and applied == 0 and zotCount > 0 then
+        return "Error: could not attach Zotero annotations"
+    end
+    return nil
 end
 
 -- Search annotations across the local library (itemAnnotations + itemData JSON).
@@ -3494,6 +5218,46 @@ INNER JOIN itemData ON itemData.itemID = items.itemID
                     version = ann_item.version,
                 })
             end
+        end
+        row = stmt:step(row)
+    end
+    stmt:close()
+    return results
+end
+
+-- List annotations for one attachment from the local DB (for Document panel union).
+-- Returns array of { key, text, comment, page, color, version }
+function API.listAttachmentAnnotations(attachment_key)
+    local results = {}
+    if attachment_key == nil then
+        return results
+    end
+    local db = API.openDB()
+    local stmt = db:prepare(ZOTERO_GET_ITEM_ANNOTATIONS_INFO)
+    local row = stmt:bind(attachment_key):step()
+    while row ~= nil do
+        local ann_key = row[1]
+        local ann_item = API.getItem(ann_key)
+        if ann_item and ann_item.data then
+            local text = ann_item.data.annotationText or ""
+            local comment = ann_item.data.annotationComment or ""
+            local page = ""
+            if ann_item.data.annotationPageLabel then
+                page = tostring(ann_item.data.annotationPageLabel)
+            elseif ann_item.data.annotationPosition then
+                local pos_ok, pos = pcall(JSON.decode, ann_item.data.annotationPosition)
+                if pos_ok and pos and pos.pageIndex ~= nil then
+                    page = tostring(pos.pageIndex + 1)
+                end
+            end
+            table.insert(results, {
+                key = ann_key,
+                text = text,
+                comment = comment,
+                page = page,
+                color = ann_item.data.annotationColor,
+                version = tonumber(row[2]) or ann_item.version,
+            })
         end
         row = stmt:step(row)
     end

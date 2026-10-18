@@ -6,7 +6,15 @@ local TextViewer = require("ui/widget/textviewer")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local util = require("util")
-local _ = require("gettext")
+local _
+do
+    local ok, mod = pcall(require, "zotero_i18n")
+    if ok and type(mod) == "function" then
+        _ = mod
+    else
+        _ = require("gettext")
+    end
+end
 
 local itemInfo = WidgetContainer:extend{
     title = _("Item information"),

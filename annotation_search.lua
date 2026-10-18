@@ -3,11 +3,22 @@ local Menu = require("ui/widget/menu")
 local InputDialog = require("ui/widget/inputdialog")
 local InfoMessage = require("ui/widget/infomessage")
 local NetworkMgr = require("ui/network/manager")
-local _ = require("gettext")
+local _
+do
+    local ok, mod = pcall(require, "zotero_i18n")
+    if ok and type(mod) == "function" then
+        _ = mod
+    else
+        _ = require("gettext")
+    end
+end
 local logger = require("logger")
 local ZoteroAPI = require("zoteroapi")
 
 local AnnotationSearch = {}
+
+-- Set by openAnnotation; consumed safely in Plugin:onReaderReady
+AnnotationSearch.pending_goto = nil
 
 local function truncate(s, max_len)
     s = s or ""
@@ -15,11 +26,11 @@ local function truncate(s, max_len)
     if #s <= max_len then
         return s
     end
-    return s:sub(1, max_len - 1) .. "…"
+    return s:sub(1, max_len - 1) .. "..."
 end
 
 local function resultLabel(row)
-    local page = row.page ~= "" and ("p." .. row.page .. " — ") or ""
+    local page = row.page ~= "" and ("p." .. row.page .. " - ") or ""
     local body = row.comment ~= "" and row.comment or row.text
     if body == nil or body == "" then
         body = _("(empty)")
@@ -33,7 +44,7 @@ function AnnotationSearch.show(plugin, initial_query)
     dialog = InputDialog:new({
         title = _("Search annotations"),
         input = initial_query or "",
-        input_hint = _("text, comment, title…"),
+        input_hint = _("text, comment, title..."),
         description = _("Search highlights and notes across the synchronized Zotero library."),
         buttons = {
             {
@@ -120,31 +131,28 @@ function AnnotationSearch.openAnnotation(plugin, row)
     end
 
     local function open_path(path)
-        if path == nil then
+        if path == nil or path == "" then
             return
         end
-        if plugin and plugin.ui and plugin.ui.switchDocument then
-            plugin.ui:switchDocument(path)
-        elseif plugin and plugin.ui and plugin.ui.openFile then
-            plugin.ui:openFile(path)
-        else
-            local ReaderUI = require("apps/reader/readerui")
-            ReaderUI:showReader(path)
-        end
-        -- Try goto page after a short delay
-        local page = tonumber(row.page)
-        if page then
-            UIManager:scheduleIn(0.5, function()
-                local ui = plugin and plugin.ui
-                if ui and ui.paging and ui.paging.onGotoPage then
-                    ui.paging:onGotoPage(page)
-                elseif ui and ui.document and ui.document.gotoPage then
-                    pcall(function()
-                        ui.document:gotoPage(page)
-                    end)
-                end
+        -- Defer page jump to onReaderReady (avoids crash after switchDocument)
+        AnnotationSearch.pending_goto = {
+            path = path,
+            page = tonumber(row.page),
+        }
+        UIManager:scheduleIn(0.05, function()
+            local ok, err = pcall(function()
+                require("apps/reader/readerui"):showReader(path)
             end)
-        end
+            if not ok then
+                AnnotationSearch.pending_goto = nil
+                logger.err("Zotero: showReader failed: ", err)
+                UIManager:show(InfoMessage:new({
+                    text = _("Could not open file."),
+                    timeout = 3,
+                    icon = "notice-warning",
+                }))
+            end
+        end)
     end
 
     local local_path = ZoteroAPI.resolveAttachmentPath(item)
