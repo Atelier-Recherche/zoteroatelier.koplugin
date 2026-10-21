@@ -244,4 +244,22 @@ return {
     ["Could not split this Zotero path into folders:\n"] = "Impossible de découper ce chemin Zotero en dossiers :\n",
     ["Example: D:\\Notes\\Lectures\\book.pdf\nbecomes <Android Notes>/Lectures/book.pdf"] =
         "Exemple : D:\\Notes\\Lectures\\livre.pdf\ndevient <Notes Android>/Lectures/livre.pdf",
+    ["Add to Zotero…"] = "Ajouter à Zotero…",
+    ["Add to Zotero (linked file)"] = "Ajouter à Zotero (fichier lié)",
+    ["Title"] = "Titre",
+    ["Author(s)"] = "Auteur(s)",
+    ["Date"] = "Date",
+    ["Create"] = "Créer",
+    ["From filename"] = "Depuis le nom de fichier",
+    ["Creating Zotero item…"] = "Création de l’élément Zotero…",
+    ["Added to Zotero as a linked file."] = "Ajouté à Zotero comme fichier lié.",
+    ["Could not add to Zotero: "] = "Impossible d’ajouter à Zotero : ",
+    ["This file is not in the linked files folder."] = "Ce fichier n’est pas dans le dossier des fichiers liés.",
+    ["This file is already linked to a Zotero attachment."] = "Ce fichier est déjà lié à une pièce jointe Zotero.",
+    ["Title is required."] = "Le titre est obligatoire.",
+    ["This document is not in Zotero yet."] = "Ce document n’est pas encore dans Zotero.",
+    ["This document is not linked to Zotero. Annotation stays local."] =
+        "Ce document n’est pas lié à Zotero. L’annotation reste locale.",
+    ["Keep local only"] = "Garder en local seulement",
+    ["Show underlines as squiggly black"] = "Afficher les soulignements en squiggly noir",
 }

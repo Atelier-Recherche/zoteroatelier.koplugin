@@ -243,4 +243,22 @@ return {
     ["Could not split this Zotero path into folders:\n"] = "No se pudo dividir esta ruta Zotero en carpetas:\n",
     ["Example: D:\\Notes\\Lectures\\book.pdf\nbecomes <Android Notes>/Lectures/book.pdf"] =
         "Ejemplo: D:\\Notes\\Lectures\\libro.pdf\npasa a ser <Notes Android>/Lectures/libro.pdf",
+    ["Add to Zotero…"] = "Añadir a Zotero…",
+    ["Add to Zotero (linked file)"] = "Añadir a Zotero (archivo vinculado)",
+    ["Title"] = "Título",
+    ["Author(s)"] = "Autor(es)",
+    ["Date"] = "Fecha",
+    ["Create"] = "Crear",
+    ["From filename"] = "Desde el nombre de archivo",
+    ["Creating Zotero item…"] = "Creando elemento de Zotero…",
+    ["Added to Zotero as a linked file."] = "Añadido a Zotero como archivo vinculado.",
+    ["Could not add to Zotero: "] = "No se pudo añadir a Zotero: ",
+    ["This file is not in the linked files folder."] = "Este archivo no está en la carpeta de archivos vinculados.",
+    ["This file is already linked to a Zotero attachment."] = "Este archivo ya está vinculado a un adjunto de Zotero.",
+    ["Title is required."] = "El título es obligatorio.",
+    ["This document is not in Zotero yet."] = "Este documento aún no está en Zotero.",
+    ["This document is not linked to Zotero. Annotation stays local."] =
+        "Este documento no está vinculado a Zotero. La anotación permanece local.",
+    ["Keep local only"] = "Mantener solo local",
+    ["Show underlines as squiggly black"] = "Mostrar subrayados como squiggly negro",
 }

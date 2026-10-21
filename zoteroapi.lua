@@ -32,6 +32,25 @@ local DocSettings = require("docsettings")
 
 local API = { ["version"] = "Zotero Atelier 2.1.6" }
 
+-- Zotero object keys: /[23456789ABCDEFGHIJKLMNPQRSTUVWXYZ]{8}/ (no 0/1/O, no lowercase)
+local ZOTERO_KEY_ALPHABET = "23456789ABCDEFGHIJKLMNPQRSTUVWXYZ"
+local _zotero_key_seeded = false
+local function newZoteroTempKey()
+    if not _zotero_key_seeded then
+        pcall(function()
+            math.randomseed(os.time() % 100000 + (os.clock() * 1000000) % 100000)
+        end)
+        _zotero_key_seeded = true
+    end
+    local out = {}
+    local n = #ZOTERO_KEY_ALPHABET
+    for i = 1, 8 do
+        local idx = math.random(1, n)
+        out[i] = ZOTERO_KEY_ALPHABET:sub(idx, idx)
+    end
+    return table.concat(out)
+end
+
 local SUPPORTED_MEDIA_TYPES = {
     [1] = "application/pdf",
     [2] = "application/epub+zip",
@@ -1017,6 +1036,52 @@ function API.setAnnotationDestinationNonZotero(mode)
     end
 end
 
+-- Paths waiting for annotation sync while offline (survive close/open / other books).
+function API.getAnnotSyncPending()
+    local t = API.settings:readSetting("annot_sync_pending", {})
+    if type(t) ~= "table" then
+        return {}
+    end
+    return t
+end
+
+function API.markAnnotSyncPending(file_path)
+    if file_path == nil or file_path == "" then
+        return
+    end
+    local pending = API.getAnnotSyncPending()
+    local norm = API.normalizePath(file_path) or file_path
+    if pending[norm] then
+        return
+    end
+    pending[norm] = true
+    API.settings:saveSetting("annot_sync_pending", pending)
+    pcall(API.saveSettingsToFile)
+end
+
+function API.clearAnnotSyncPending(file_path)
+    if file_path == nil or file_path == "" then
+        return
+    end
+    local pending = API.getAnnotSyncPending()
+    local norm = API.normalizePath(file_path) or file_path
+    if not pending[norm] then
+        return
+    end
+    pending[norm] = nil
+    API.settings:saveSetting("annot_sync_pending", pending)
+    pcall(API.saveSettingsToFile)
+end
+
+function API.isAnnotSyncPending(file_path)
+    if file_path == nil or file_path == "" then
+        return false
+    end
+    local pending = API.getAnnotSyncPending()
+    local norm = API.normalizePath(file_path) or file_path
+    return pending[norm] == true
+end
+
 -- Effective destination for a new annotation on a Zotero-linked document (no dialog).
 function API.getEffectiveZoteroDestination()
     if API.getAnnotationDestinationAsk() then
@@ -1159,6 +1224,199 @@ end
 
 function API.setLinkedFilesBase(path)
     API.settings:saveSetting("linked_files_base", API.normalizeDevicePath(path or ""))
+end
+
+-- True when file_path is under the configured linked-files (vault) folder.
+function API.isPathUnderLinkedBase(file_path)
+    if file_path == nil or file_path == "" then
+        return false
+    end
+    if not API.getLinkedFilesEnabled() then
+        return false
+    end
+    local base = API.getLinkedFilesBase()
+    if base == nil or base == "" then
+        return false
+    end
+    local nfile = API.normalizePathForCompare(file_path) or API.normalizePath(file_path)
+    local nbase = API.normalizePathForCompare(base) or API.normalizePath(base)
+    if nfile == nil or nfile == "" or nbase == nil or nbase == "" then
+        return false
+    end
+    local fl = string.lower(nfile)
+    local bl = string.lower(nbase)
+    if fl == bl then
+        return true
+    end
+    if bl:sub(-1) ~= "/" then
+        bl = bl .. "/"
+    end
+    return fl:sub(1, #bl) == bl
+end
+
+local function joinDesktopPath(root, rel)
+    root = tostring(root or ""):gsub("[/\\]+$", "")
+    rel = tostring(rel or ""):gsub("^[/\\]+", "")
+    if root == "" or rel == "" then
+        return nil
+    end
+    -- Match existing library style: Windows absolute paths use backslashes
+    if root:match("^%a:") then
+        root = root:gsub("/", "\\")
+        rel = rel:gsub("/", "\\")
+        return root .. "\\" .. rel
+    end
+    root = root:gsub("\\", "/")
+    rel = rel:gsub("\\", "/")
+    return root .. "/" .. rel
+end
+
+-- Relative path of file under linked_files_base, or nil.
+local function relPathUnderLinkedBase(file_path)
+    local base = API.normalizePath(API.getLinkedFilesBase() or "")
+    local file = API.normalizePath(file_path or "")
+    if base == "" or file == "" then
+        return nil
+    end
+    local bl = string.lower(base)
+    local fl = string.lower(file)
+    if fl == bl then
+        return nil
+    end
+    if fl:sub(1, #bl) ~= bl then
+        return nil
+    end
+    local rel = file:sub(#base + 1):gsub("^/", "")
+    if rel == "" then
+        return nil
+    end
+    return rel
+end
+
+-- Zotero linked-file path written into item.data.path.
+-- Prefer absolute desktop paths (same style as existing library items: D:\Notes\...),
+-- because attachments: requires a correctly configured base directory on every machine.
+function API.linkedAttachmentZoteroPath(file_path)
+    local file = API.normalizePath(file_path or "")
+
+    -- 1) Reverse path mappings (device "to" → Zotero/PC "from")
+    local mappings = API.getPathMappings()
+    local best_from, best_rel, best_to_len = nil, nil, -1
+    for _, m in ipairs(mappings) do
+        local to = API.normalizePath(m.to or "")
+        local from = m.from or ""
+        if to ~= "" and from ~= "" and file ~= "" then
+            local tl = string.lower(to)
+            local fl = string.lower(file)
+            if (fl == tl or fl:sub(1, #tl + 1) == tl .. "/") and #to > best_to_len then
+                local map_rel = file:sub(#to + 1):gsub("^/", "")
+                if map_rel ~= "" then
+                    best_from = from
+                    best_rel = map_rel
+                    best_to_len = #to
+                end
+            end
+        end
+    end
+    if best_from and best_rel then
+        local joined = joinDesktopPath(best_from, best_rel)
+        if joined then
+            return joined
+        end
+    end
+
+    -- 2) Infer desktop root from existing absolute linked_file paths in the library
+    local rel = relPathUnderLinkedBase(file_path)
+    if rel then
+        local root = API.inferDesktopLinkedRoot()
+        if root then
+            local joined = joinDesktopPath(root, rel)
+            if joined then
+                return joined
+            end
+        end
+    end
+
+    -- 3) Fallback: portable attachments: form (needs Zotero base-dir config)
+    if rel and rel ~= "" then
+        return "attachments:" .. rel
+    end
+    local base_name = API.basenameOfPath(file_path) or "file"
+    return "attachments:" .. base_name
+end
+
+-- If a linked attachment still uses attachments: but we can express an absolute
+-- desktop path (matching the rest of the library), update it on Zotero.
+function API.healLinkedAttachmentPath(file_path, attachment_key)
+    if not file_path or not attachment_key then
+        return false
+    end
+    local item = API.getItem(attachment_key)
+    if not item or not item.data or item.data.linkMode ~= "linked_file" then
+        return false
+    end
+    local cur = tostring(item.data.path or "")
+    if not cur:match("^attachments:") then
+        return false
+    end
+    local desired = API.linkedAttachmentZoteroPath(file_path)
+    if desired == nil or desired == "" or desired == cur or desired:match("^attachments:") then
+        return false
+    end
+    local version = item.version or (item.data and item.data.version)
+    local payload = {
+        key = attachment_key,
+        version = version,
+        path = desired,
+    }
+    logger.info(
+        ("Zotero: healing linked path %s → %s"):format(cur, desired)
+    )
+    -- updateItems returns (updated, fails); fails is always a table (possibly empty)
+    local updated, fails = API.updateItems({ payload })
+    if type(fails) == "string" then
+        logger.warn("Zotero: healLinkedAttachmentPath failed: ", fails)
+        return false
+    end
+    if type(fails) == "table" and #fails > 0 then
+        logger.warn("Zotero: healLinkedAttachmentPath failed: ", JSON.encode(fails))
+        return false
+    end
+    local ok_item = updated and (updated[1] or updated[attachment_key])
+    if not ok_item and type(updated) == "table" then
+        for _, v in pairs(updated) do
+            if type(v) == "table" and (v.key == attachment_key or v.data) then
+                ok_item = v
+                break
+            end
+        end
+    end
+    if ok_item then
+        API.clearAttachmentPathCache()
+        API.rememberAttachmentKeyForPath(file_path, attachment_key)
+        return true
+    end
+    logger.warn("Zotero: healLinkedAttachmentPath: no updated item returned")
+    return false
+end
+
+-- Fast path for menu enablement: under linked-files vault only (no DB scan).
+-- "Already linked" is checked later in showAddLinkedBookDialog / createLinkedBookItem.
+function API.canAddLinkedBook(file_path)
+    return API.isPathUnderLinkedBase(file_path)
+end
+
+function API.getDisplaySquigglyBlack()
+    return API.settings:isTrue("display_squiggly_black")
+end
+
+function API.setDisplaySquigglyBlack(enabled)
+    API.settings:saveSetting("display_squiggly_black", enabled and true or false)
+end
+
+function API.toggleDisplaySquigglyBlack()
+    API.settings:toggle("display_squiggly_black")
+    return API.getDisplaySquigglyBlack()
 end
 
 function API.getExternalStorageEnabled()
@@ -1707,6 +1965,61 @@ INNER JOIN items ON items.itemID = itemData.itemID
 WHERE items.itemTypeID = 3;
 ]]
 
+-- Infer the desktop/Zotero absolute root that corresponds to linked_files_base,
+-- by matching existing linked_file paths (e.g. D:\Notes\Lectures\foo.pdf).
+-- Must live after ZOTERO_LIST_ATTACHMENT_ITEMS (Lua local scope).
+function API.inferDesktopLinkedRoot()
+    if API._inferred_desktop_root ~= nil then
+        return API._inferred_desktop_root ~= false and API._inferred_desktop_root or nil
+    end
+    local base = API.normalizePath(API.getLinkedFilesBase() or "")
+    if base == "" then
+        API._inferred_desktop_root = false
+        return nil
+    end
+    local votes = {}
+    local ok_scan, err_scan = pcall(function()
+        local db = API.openDB()
+        local stmt = db:prepare(ZOTERO_LIST_ATTACHMENT_ITEMS)
+        local row = stmt:reset():step()
+        while row ~= nil do
+            local ok, item = pcall(JSON.decode, row[1])
+            if ok and item and item.data and item.data.linkMode == "linked_file" then
+                local raw = tostring(item.data.path or "")
+                if raw ~= "" and not raw:match("^attachments:") and API.isAbsolutePath(raw) then
+                    local p = API.normalizePath(raw)
+                    for _, choice in ipairs(API.listZoteroPathPrefixes(p)) do
+                        local prefix_norm = API.normalizePath(choice.from or "")
+                        if prefix_norm ~= "" and #p > #prefix_norm then
+                            local rem = p:sub(#prefix_norm + 1):gsub("^/", "")
+                            if rem ~= "" then
+                                local candidate = API.normalizePath(BaseUtil.joinPath(base, rem))
+                                if file_exists(candidate) then
+                                    votes[prefix_norm] = (votes[prefix_norm] or 0) + 1
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            row = stmt:step(row)
+        end
+        stmt:close()
+    end)
+    if not ok_scan then
+        logger.warn("Zotero: inferDesktopLinkedRoot failed: ", err_scan)
+    end
+    local best, best_n = nil, 0
+    for pref, n in pairs(votes) do
+        -- Prefer more matches; on ties prefer shorter root (library base, not a subfolder)
+        if n > best_n or (n == best_n and best ~= nil and #pref < #best) or (n == best_n and best == nil) then
+            best, best_n = pref, n
+        end
+    end
+    API._inferred_desktop_root = best or false
+    return best
+end
+
 local function probe_path_entry(label, path)
     return {
         label = label,
@@ -2011,6 +2324,45 @@ local _file_to_key_cache = {}
 
 function API.clearAttachmentPathCache()
     _file_to_key_cache = {}
+    API._inferred_desktop_root = nil
+end
+
+-- One-shot: rewrite attachments: paths to absolute desktop paths when possible.
+function API.healAllAttachmentsPrefixedPaths()
+    local healed = 0
+    local ok_scan, err_scan = pcall(function()
+        local base = API.getLinkedFilesBase()
+        local db = API.openDB()
+        local stmt = db:prepare(ZOTERO_LIST_ATTACHMENT_ITEMS)
+        local row = stmt:reset():step()
+        local todos = {}
+        while row ~= nil do
+            local ok, item = pcall(JSON.decode, row[1])
+            if ok and item and item.data and item.data.linkMode == "linked_file" then
+                local raw = tostring(item.data.path or "")
+                if raw:match("^attachments:") then
+                    local local_path = API.resolveLinkedPath(raw, base)
+                    if local_path and file_exists(local_path) then
+                        table.insert(todos, { key = item.key, path = local_path })
+                    end
+                end
+            end
+            row = stmt:step(row)
+        end
+        stmt:close()
+        for _, t in ipairs(todos) do
+            if API.healLinkedAttachmentPath(t.path, t.key) then
+                healed = healed + 1
+            end
+        end
+    end)
+    if not ok_scan then
+        logger.warn("Zotero: healAllAttachmentsPrefixedPaths failed: ", err_scan)
+    end
+    if healed > 0 then
+        logger.info("Zotero: healed ", healed, " linked attachment path(s)")
+    end
+    return healed
 end
 
 function API.rememberAttachmentKeyForPath(file_path, key)
@@ -3856,8 +4208,11 @@ function API.syncAnnotations(progress_callback)
 end
 
 -- Sync create/update/delete annotations for one attachment file.
+-- opts.push_only: skip server pull + sidecar attach (fast close / local-edit push).
 -- Returns upload_fails, delete_fails, update_fails
-function API.syncAnnotationsForAttachment(key, file_path)
+function API.syncAnnotationsForAttachment(key, file_path, opts)
+    opts = opts or {}
+    local push_only = opts.push_only == true
     if key == nil or file_path == nil or not file_exists(file_path) then
         return 0, 0, 0
     end
@@ -3885,34 +4240,38 @@ function API.syncAnnotationsForAttachment(key, file_path)
         logger.info("Zotero: local delete candidate " .. tostring(del_key))
     end
 
-    -- Refresh from Zotero API (remote adds / deletes / style). Must succeed for Z→K sync.
     local remote_keys = {}
-    local refresh_ok, refresh_ret = API.refreshAttachmentAnnotationsFromServer(key, keys_now)
-    if refresh_ok and type(refresh_ret) == "table" then
-        remote_keys = refresh_ret
-    else
-        logger.warn("Zotero: server annotation pull failed: ", refresh_ret)
-    end
-
-    -- Pull remote annotations into sidecar (skip keys the user deleted locally)
-    local parent_item = API.getItem(key)
-    if parent_item then
-        local att_ok, att_err = pcall(
-            API.attachItemAnnotations,
-            parent_item,
-            nil,
-            file_path,
-            true,
-            local_delete_set
-        )
-        if not att_ok then
-            logger.err("Zotero: attachItemAnnotations crashed: ", att_err)
+    local refresh_ok = false
+    if not push_only then
+        -- Refresh from Zotero API (remote adds / deletes / style). Must succeed for Z→K sync.
+        local refresh_ret
+        refresh_ok, refresh_ret = API.refreshAttachmentAnnotationsFromServer(key, keys_now)
+        if refresh_ok and type(refresh_ret) == "table" then
+            remote_keys = refresh_ret
+        else
+            logger.warn("Zotero: server annotation pull failed: ", refresh_ret)
         end
-    else
-        logger.warn("Zotero: no parent item for attachment " .. tostring(key))
+
+        -- Pull remote annotations into sidecar (skip keys the user deleted locally)
+        local parent_item = API.getItem(key)
+        if parent_item then
+            local att_ok, att_err = pcall(
+                API.attachItemAnnotations,
+                parent_item,
+                nil,
+                file_path,
+                true,
+                local_delete_set
+            )
+            if not att_ok then
+                logger.err("Zotero: attachItemAnnotations crashed: ", att_err)
+            end
+        else
+            logger.warn("Zotero: no parent item for attachment " .. tostring(key))
+        end
     end
 
-    -- After pull: strip local-deletes AND remote-deletes (keys with zoteroKey not on server)
+    -- After pull (or push-only): strip local-deletes; remote-deletes only after a successful pull
     local doc_settings = DocSettings:open(file_path)
     local sdr_annotations = doc_settings:readSetting("annotations", {}) or {}
     local stripped = false
@@ -4096,6 +4455,214 @@ function API.upsertCreatedAnnotationItem(created, parent_key, request_payload)
     end
 end
 
+-- Upsert a parent book + linked_file attachment into the local DB (not annotation-only).
+function API.upsertCreatedLinkedBookItems(parent_created, child_created, parent_payload, child_payload)
+    if parent_created == nil or parent_created.key == nil or child_created == nil or child_created.key == nil then
+        return false, "missing created keys"
+    end
+    local parent_key = parent_created.key
+    local child_key = child_created.key
+    local parent_ver = parent_created.version or API.getUserLibraryVersion() or 0
+    local child_ver = child_created.version or parent_ver
+
+    local function build_item(created, payload, fallback_type)
+        if created.data ~= nil then
+            return created
+        end
+        local data = {}
+        if type(payload) == "table" then
+            for k, v in pairs(payload) do
+                data[k] = v
+            end
+        end
+        data.key = created.key
+        data.version = created.version or parent_ver
+        data.itemType = data.itemType or fallback_type
+        return {
+            key = created.key,
+            version = data.version,
+            data = data,
+        }
+    end
+
+    local parent_item = build_item(parent_created, parent_payload, "book")
+    local child_item = build_item(child_created, child_payload, "attachment")
+    if child_item.data then
+        child_item.data.parentItem = parent_key
+    end
+
+    local ok, err = pcall(function()
+        local db = API.openDB()
+        local stmt_item = db:prepare(ZOTERO_DB_UPDATE_ITEM)
+        local stmt_data = db:prepare(ZOTERO_DB_UPDATE_ITEMDATA)
+        stmt_item:reset():bind(1, "book", parent_key, parent_ver):step()
+        stmt_data:reset():bind(parent_key, JSON.encode(parent_item)):step()
+        stmt_item:reset():bind(1, "attachment", child_key, child_ver):step()
+        stmt_data:reset():bind(child_key, JSON.encode(child_item)):step()
+        stmt_item:close()
+        stmt_data:close()
+        -- Direct attachment link (do not require collection membership).
+        local stmt_att = db:prepare(ZOTERO_UPSERT_ITEM_ATTACHMENTS)
+        stmt_att:reset():bind(child_key, parent_key):step()
+        stmt_att:close()
+    end)
+    if not ok then
+        logger.err("Zotero: upsertCreatedLinkedBookItems failed: ", err)
+        return false, err
+    end
+    return true, nil
+end
+
+local function parseCreatorsFromAuthorString(authors)
+    local creators = {}
+    if authors == nil or authors == "" then
+        return creators
+    end
+    local raw = tostring(authors)
+    -- Normalize separators then split
+    raw = raw:gsub("%s+&%s+", ";"):gsub("%s+and%s+", ";"):gsub("%s*,%s*and%s+", ";")
+    for chunk in raw:gmatch("[^;]+") do
+        local name = chunk:gsub("^%s+", ""):gsub("%s+$", "")
+        if name ~= "" then
+            local last, first = name:match("^([^,]+),%s*(.+)$")
+            if last and first then
+                table.insert(creators, {
+                    creatorType = "author",
+                    lastName = last:gsub("^%s+", ""):gsub("%s+$", ""),
+                    firstName = first:gsub("^%s+", ""):gsub("%s+$", ""),
+                })
+            else
+                local first_n, last_n = name:match("^(.+)%s+(%S+)$")
+                if first_n and last_n and first_n ~= last_n then
+                    table.insert(creators, {
+                        creatorType = "author",
+                        firstName = first_n,
+                        lastName = last_n,
+                    })
+                else
+                    table.insert(creators, {
+                        creatorType = "author",
+                        name = name,
+                    })
+                end
+            end
+        end
+    end
+    return creators
+end
+
+local function contentTypeForPath(file_path)
+    local lower = string.lower(tostring(file_path or ""))
+    if lower:match("%.epub$") then
+        return "application/epub+zip"
+    end
+    if lower:match("%.html?$") then
+        return "text/html"
+    end
+    return "application/pdf"
+end
+
+-- Create a Zotero book + linked_file attachment (no file upload).
+-- opts: { title, authors, date, file_path }
+-- Returns attachment_key, error_message
+function API.createLinkedBookItem(opts)
+    opts = opts or {}
+    local file_path = opts.file_path
+    if file_path == nil or file_path == "" then
+        return nil, "missing file_path"
+    end
+    if not API.isPathUnderLinkedBase(file_path) then
+        return nil, "File is not under the linked files folder"
+    end
+    local existing = API.findAttachmentKeyByFilePath(file_path)
+    if existing then
+        return existing, nil
+    end
+
+    local title = opts.title
+    if title == nil or title == "" then
+        title = API.basenameOfPath(file_path) or "Untitled"
+        title = title:gsub("%.[^%.]+$", "")
+    end
+    local date = opts.date or ""
+    local creators = parseCreatorsFromAuthorString(opts.authors)
+    local filename = API.basenameOfPath(file_path) or title
+    local zpath = API.linkedAttachmentZoteroPath(file_path)
+    local content_type = contentTypeForPath(file_path)
+
+    -- Client-supplied keys let parent+child share one POST (must match Zotero charset).
+    local parent_tmp = newZoteroTempKey()
+    local child_tmp = newZoteroTempKey()
+    while child_tmp == parent_tmp do
+        child_tmp = newZoteroTempKey()
+    end
+
+    -- Do NOT send empty tags/collections/creators tables: Lua {} encodes as JSON
+    -- object {}, and Zotero rejects that ("must be an array"). Omit optional fields.
+    local parent_payload = {
+        key = parent_tmp,
+        itemType = "book",
+        title = title,
+        date = date,
+    }
+    if type(creators) == "table" and #creators > 0 then
+        parent_payload.creators = creators
+    end
+    local child_payload = {
+        key = child_tmp,
+        itemType = "attachment",
+        parentItem = parent_tmp,
+        linkMode = "linked_file",
+        contentType = content_type,
+        charset = "",
+        path = zpath,
+        title = filename,
+        note = "",
+    }
+
+    local created, fails = API.createItems({ parent_payload, child_payload })
+    if type(fails) == "string" then
+        return nil, fails
+    end
+    if type(fails) == "table" and #fails > 0 and (created == nil or created[1] == nil or created[2] == nil) then
+        local msg = fails[1] and (fails[1].message or JSON.encode(fails[1])) or "create failed"
+        return nil, tostring(msg)
+    end
+    local parent_created = created and created[1]
+    local child_created = created and created[2]
+    if parent_created == nil or parent_created.key == nil or child_created == nil or child_created.key == nil then
+        return nil, "Zotero did not return created item keys"
+    end
+
+    -- Rewrite payloads with real keys for local DB
+    parent_payload.key = parent_created.key
+    parent_payload.version = parent_created.version
+    child_payload.key = child_created.key
+    child_payload.version = child_created.version
+    child_payload.parentItem = parent_created.key
+
+    local ok_up, up_err = API.upsertCreatedLinkedBookItems(
+        parent_created,
+        child_created,
+        parent_payload,
+        child_payload
+    )
+    if not ok_up then
+        logger.warn("Zotero: linked book created remotely but local upsert failed: ", up_err)
+    end
+
+    API.clearAttachmentPathCache()
+    API.rememberAttachmentKeyForPath(file_path, child_created.key)
+    logger.info(
+        ("Zotero: created linked book parent=%s attachment=%s path=%s"):format(
+            tostring(parent_created.key),
+            tostring(child_created.key),
+            zpath
+        )
+    )
+    return child_created.key, nil
+end
+
 function API.createItems(items)
     -- up to 50 items can be created with one request, see https://www.zotero.org/support/dev/web_api/v3/write_requests#creating_multiple_objects for details
     local API_MAX_ITEMS_PER_REQUEST = 50
@@ -4190,8 +4757,13 @@ function API.createItems(items)
             n_ok = n_ok + 1
             local index = start_item + (tonumber(k) or 0) + 1
             created_items[index] = v
-            local parent_key = items[index] and items[index].parentItem
-            API.upsertCreatedAnnotationItem(v, parent_key, items[index])
+            local req = items[index]
+            local itype = req and req.itemType
+            -- Only auto-upsert annotations; books/attachments are handled by callers
+            if itype == nil or itype == "annotation" then
+                local parent_key = req and req.parentItem
+                API.upsertCreatedAnnotationItem(v, parent_key, req)
+            end
         end
 
         for k, v in pairs(result["unchanged"] or {}) do
@@ -4202,8 +4774,12 @@ function API.createItems(items)
                 ["key"] = zotero_key,
                 ["version"] = type(v) == "table" and v.version or nil,
             }
-            local parent_key = items[index] and items[index].parentItem
-            API.upsertCreatedAnnotationItem(created_items[index], parent_key, items[index])
+            local req = items[index]
+            local itype = req and req.itemType
+            if itype == nil or itype == "annotation" then
+                local parent_key = req and req.parentItem
+                API.upsertCreatedAnnotationItem(created_items[index], parent_key, req)
+            end
         end
         for k, v in pairs(result["failed"] or {}) do
             n_fail = n_fail + 1

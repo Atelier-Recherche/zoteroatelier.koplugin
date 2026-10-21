@@ -243,4 +243,22 @@ return {
     ["Could not split this Zotero path into folders:\n"] = "Dieser Zotero-Pfad ließ sich nicht in Ordner teilen:\n",
     ["Example: D:\\Notes\\Lectures\\book.pdf\nbecomes <Android Notes>/Lectures/book.pdf"] =
         "Beispiel: D:\\Notes\\Lectures\\buch.pdf\nwird zu <Android Notes>/Lectures/buch.pdf",
+    ["Add to Zotero…"] = "Zu Zotero hinzufügen…",
+    ["Add to Zotero (linked file)"] = "Zu Zotero hinzufügen (verknüpfte Datei)",
+    ["Title"] = "Titel",
+    ["Author(s)"] = "Autor(en)",
+    ["Date"] = "Datum",
+    ["Create"] = "Erstellen",
+    ["From filename"] = "Aus Dateiname",
+    ["Creating Zotero item…"] = "Zotero-Eintrag wird erstellt…",
+    ["Added to Zotero as a linked file."] = "Als verknüpfte Datei zu Zotero hinzugefügt.",
+    ["Could not add to Zotero: "] = "Konnte nicht zu Zotero hinzufügen: ",
+    ["This file is not in the linked files folder."] = "Diese Datei liegt nicht im Ordner für verknüpfte Dateien.",
+    ["This file is already linked to a Zotero attachment."] = "Diese Datei ist bereits mit einem Zotero-Anhang verknüpft.",
+    ["Title is required."] = "Titel ist erforderlich.",
+    ["This document is not in Zotero yet."] = "Dieses Dokument ist noch nicht in Zotero.",
+    ["This document is not linked to Zotero. Annotation stays local."] =
+        "Dieses Dokument ist nicht mit Zotero verknüpft. Annotation bleibt lokal.",
+    ["Keep local only"] = "Nur lokal behalten",
+    ["Show underlines as squiggly black"] = "Unterstreichungen als schwarze Squiggly anzeigen",
 }

@@ -597,7 +597,8 @@ function Annotations.annotationNeedsUpdate(local_ann, zotero_item, file_path)
     if local_note ~= remote_note then
         return true
     end
-    -- EPUB: rebuild CFI and compare to what Zotero currently stores
+    -- EPUB CFI: avoid unzipping the EPUB on every sync. Prefer cached local CFI;
+    -- rebuild only when remote or local CFI lacks a text range (no underline in Zotero).
     local xp = local_ann.pos0
     local has_xp = (type(xp) == "string" and xp:find("DocFragment", 1, true))
         or (type(xp) == "table" and xp.xpointer and tostring(xp.xpointer):find("DocFragment", 1, true))
@@ -610,29 +611,24 @@ function Annotations.annotationNeedsUpdate(local_ann, zotero_item, file_path)
                 remote_cfi = parsed.value
             end
         end
-        if not remote_cfi or not tostring(remote_cfi):find(",", 1, true) then
+        local remote_ok = remote_cfi and tostring(remote_cfi):find(",", 1, true)
+        local local_cfi = local_ann.zoteroCfi
+        local local_ok = local_cfi and tostring(local_cfi):find(",", 1, true)
+        if not remote_ok then
             return true
         end
-        -- Always rebuild from current xpointers when possible. Cached CFIs may be wrong
-        -- (old text()[N] parse bug) even when local==remote — Zotero then shows note, no underline.
+        if local_ok then
+            return local_cfi ~= remote_cfi
+        end
+        -- No good local cache: rebuild once to decide (and cache for next sync)
         if file_path and Annotations.isEpubPath and Annotations.isEpubPath(file_path) then
             local full = Annotations.buildEpubAnnotationPosition(local_ann, file_path)
             if full and full.value then
-                if full.value ~= remote_cfi then
-                    local_ann.zoteroCfi = full.value
-                    return true
-                end
                 local_ann.zoteroCfi = full.value
-                -- CFI matches remote; note/color/text already compared above
-                return false
+                return full.value ~= remote_cfi
             end
         end
-        if local_ann.zoteroCfi and not tostring(local_ann.zoteroCfi):find(",", 1, true) then
-            return true
-        end
-        if local_ann.zoteroCfi and local_ann.zoteroCfi ~= remote_cfi then
-            return true
-        end
+        return true
     end
     return false
 end

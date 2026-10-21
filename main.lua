@@ -815,8 +815,31 @@ function Plugin:reloadReaderAnnotations(readerui, expected_file)
     end)
 end
 
+local function networkIsOnline()
+    local checked = false
+    local online = false
+    pcall(function()
+        if NetworkMgr.isOnline then
+            checked = true
+            online = NetworkMgr:isOnline() and true or false
+        elseif NetworkMgr.isWifiOn then
+            checked = true
+            online = NetworkMgr:isWifiOn() and true or false
+        elseif NetworkMgr.isConnected then
+            checked = true
+            online = NetworkMgr:isConnected() and true or false
+        end
+    end)
+    -- If NetworkMgr has no status API, do not permanently stall auto-sync.
+    if not checked then
+        return true
+    end
+    return online
+end
+
 -- Sync annotations for a file path (works even if reader is closing).
 -- opts.reload: reload reader after sync (default true if reader still open)
+-- opts.prompt_wifi: if true (manual sync), may ask to enable WiFi; auto syncs never prompt
 function Plugin:syncOpenDocumentAnnotations(readerui, opts)
     opts = opts or {}
     if not init_done then
@@ -866,18 +889,31 @@ function Plugin:syncOpenDocumentAnnotations(readerui, opts)
     self._annot_sync_gen = (self._annot_sync_gen or 0) + 1
     local sync_gen = self._annot_sync_gen
     local closing = opts.reload == false
+    local prompt_wifi = opts.prompt_wifi == true
 
-    NetworkMgr:runWhenOnline(function()
+    -- Auto syncs must not spam WiFi dialogs when offline; queue until later.
+    if not networkIsOnline() and not prompt_wifi then
+        self._annot_dirty = true
+        ZoteroAPI.markAnnotSyncPending(file_path)
+        logger.info("Zotero: defer annotation sync (offline, no WiFi prompt): ", file_path)
+        return
+    end
+
+    local function run_sync()
         local push_u, push_d, push_up = 0, 0, 0
         local ok, err = pcall(function()
             if item then
                 pcall(ZoteroAPI.setAttachmentVersionByKey, key, item.version or 1)
             end
-            push_u, push_d, push_up = ZoteroAPI.syncAnnotationsForAttachment(key, file_path)
+            push_u, push_d, push_up = ZoteroAPI.syncAnnotationsForAttachment(key, file_path, {
+                push_only = opts.push_only == true,
+            })
             return true
         end)
         if not ok then
             logger.err("Zotero: document annotation sync failed: ", err)
+            self._annot_dirty = true
+            ZoteroAPI.markAnnotSyncPending(file_path)
             if opts.notify and not closing then
                 UIManager:show(InfoMessage:new({
                     text = _("Annotation sync failed: ") .. tostring(err),
@@ -886,6 +922,15 @@ function Plugin:syncOpenDocumentAnnotations(readerui, opts)
                 }))
             end
             return
+        end
+        -- Local creates/updates/deletes were pushed; clear dirty so close stays fast
+        if (push_u or 0) + (push_d or 0) + (push_up or 0) == 0 then
+            self._annot_dirty = false
+            ZoteroAPI.clearAnnotSyncPending(file_path)
+        else
+            -- Partial failure: keep pending for a later retry
+            self._annot_dirty = true
+            ZoteroAPI.markAnnotSyncPending(file_path)
         end
         -- Only reload if this sync gen is still current and the same file is open
         local still_same = readerui
@@ -930,7 +975,14 @@ function Plugin:syncOpenDocumentAnnotations(readerui, opts)
                 icon = icon,
             }))
         end
-    end)
+    end
+
+    if prompt_wifi then
+        NetworkMgr:runWhenOnline(run_sync)
+    else
+        -- Already online (checked above): run without WiFi prompt machinery
+        run_sync()
+    end
 end
 
 function Plugin:applyDestinationToAnnotation(ui, ann, dest, opts)
@@ -1038,6 +1090,338 @@ function Plugin:promptAnnotationDestination(ui, ann)
     UIManager:show(dialog)
 end
 
+-- Parse title / authors / date from a filename stem (no extension).
+-- Patterns: "Author - Title", "Author – Title (2020)", "Title (2020)", underscores as spaces.
+local function parseFilenameMetadata(file_path)
+    local base = ZoteroAPI.basenameOfPath(file_path) or "Untitled"
+    local stem = base:gsub("%.[^%.]+$", "")
+    stem = stem:gsub("_+", " "):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    local title, authors, date = stem, "", ""
+
+    local y = stem:match("%((%d%d%d%d)%)%s*$") or stem:match("%[(%d%d%d%d)%]%s*$")
+    if y then
+        date = y
+        stem = stem
+            :gsub("%s*%(%d%d%d%d%)%s*$", "")
+            :gsub("%s*%[%d%d%d%d%]%s*$", "")
+            :gsub("%s+$", "")
+    end
+
+    -- Author - Title / Author – Title / Author — Title
+    local a, t = stem:match("^(.+)%s+[–—%-]+%s+(.+)$")
+    if a and t and #a >= 2 and #t >= 2 then
+        authors = a:gsub("%s+$", "")
+        title = t:gsub("^%s+", "")
+    else
+        title = stem
+    end
+    if title == "" then
+        title = base:gsub("%.[^%.]+$", "")
+    end
+    return title, authors, date
+end
+
+local function guessDocMetadata(file_path, ui)
+    local title, authors, date = "", "", ""
+    pcall(function()
+        local ds = DocSettings:open(file_path)
+        local props = ds:readSetting("doc_props") or {}
+        local custom = ds:readSetting("custom_props") or {}
+        local stats = ds:readSetting("stats") or {}
+        title = tostring(custom.title or props.title or stats.title or "")
+        authors = tostring(custom.authors or props.authors or stats.authors or "")
+        date = tostring(custom.date or props.date or stats.date or custom.years or props.years or "")
+        pcall(function()
+            ds:close()
+        end)
+    end)
+    if (title == "" or authors == "") and ui and ui.document then
+        pcall(function()
+            local props = ui.document.info or ui.document.props or {}
+            if title == "" and props.title then
+                title = tostring(props.title)
+            end
+            if authors == "" and (props.authors or props.author) then
+                authors = tostring(props.authors or props.author)
+            end
+            if date == "" and props.date then
+                date = tostring(props.date)
+            end
+        end)
+    end
+    if title == "" then
+        local t, a, d = parseFilenameMetadata(file_path)
+        title = t
+        if authors == "" then
+            authors = a
+        end
+        if date == "" then
+            date = d
+        end
+    end
+    return title, authors, date
+end
+
+local function setMultiInputFieldTexts(dialog, values)
+    if not dialog or type(values) ~= "table" then
+        return false
+    end
+    local inputs = dialog.input_fields or dialog._input_fields
+    if type(inputs) ~= "table" then
+        return false
+    end
+    for i, text in ipairs(values) do
+        local field = inputs[i]
+        if type(field) == "table" and field.setText then
+            pcall(function()
+                field:setText(tostring(text or ""))
+            end)
+        end
+    end
+    return true
+end
+
+function Plugin:applyDisplayRestyle(ui)
+    local mod = loadPluginModule(self, "display_restyle")
+    if not mod then
+        return
+    end
+    mod.apply(ZoteroAPI.getDisplaySquigglyBlack())
+    if ui then
+        mod.refreshReader(ui)
+    end
+end
+
+-- opts.on_success(attachment_key) optional callback after successful create
+function Plugin:showAddLinkedBookDialog(file_path, ui, opts)
+    opts = opts or {}
+    ui = ui or self.ui
+    file_path = file_path or (ui and ui.document and ui.document.file)
+    if not file_path or file_path == "" then
+        UIManager:show(InfoMessage:new({
+            text = _("Open a document first."),
+            timeout = 3,
+            icon = "notice-warning",
+        }))
+        return
+    end
+    if not ZoteroAPI.isPathUnderLinkedBase(file_path) then
+        UIManager:show(InfoMessage:new({
+            text = _("This file is not in the linked files folder."),
+            timeout = 4,
+            icon = "notice-warning",
+        }))
+        return
+    end
+    local existing = ZoteroAPI.findAttachmentKeyByFilePath(file_path)
+    if existing then
+        UIManager:show(InfoMessage:new({
+            text = _("This file is already linked to a Zotero attachment."),
+            timeout = 3,
+        }))
+        return
+    end
+
+    local title0, authors0, date0 = guessDocMetadata(file_path, ui)
+    if opts._force_title ~= nil then
+        title0 = opts._force_title
+    end
+    if opts._force_authors ~= nil then
+        authors0 = opts._force_authors
+    end
+    if opts._force_date ~= nil then
+        date0 = opts._force_date
+    end
+    local dialog
+    dialog = MultiInputDialog:new({
+        title = _("Add to Zotero (linked file)"),
+        fields = {
+            {
+                text = title0,
+                hint = _("Title"),
+            },
+            {
+                text = authors0,
+                hint = _("Author(s)"),
+            },
+            {
+                text = date0,
+                hint = _("Date"),
+            },
+        },
+        buttons = {
+            {
+                {
+                    text = _("From filename"),
+                    callback = function()
+                        local t, a, d = parseFilenameMetadata(file_path)
+                        if not setMultiInputFieldTexts(dialog, { t, a, d }) then
+                            -- Fallback if field widgets are not exposed: reopen dialog
+                            dialog:onClose()
+                            UIManager:close(dialog)
+                            local reopen_opts = {}
+                            for k, v in pairs(opts) do
+                                reopen_opts[k] = v
+                            end
+                            reopen_opts._force_title = t
+                            reopen_opts._force_authors = a
+                            reopen_opts._force_date = d
+                            self:showAddLinkedBookDialog(file_path, ui, reopen_opts)
+                        end
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        dialog:onClose()
+                        UIManager:close(dialog)
+                        if opts.on_cancel then
+                            opts.on_cancel()
+                        end
+                    end,
+                },
+                {
+                    text = _("Create"),
+                    callback = function()
+                        local fields = dialog:getFields()
+                        local title = (fields[1] or ""):gsub("^%s+", ""):gsub("%s+$", "")
+                        local authors = (fields[2] or ""):gsub("^%s+", ""):gsub("%s+$", "")
+                        local date = (fields[3] or ""):gsub("^%s+", ""):gsub("%s+$", "")
+                        if title == "" then
+                            UIManager:show(InfoMessage:new({
+                                text = _("Title is required."),
+                                timeout = 3,
+                                icon = "notice-warning",
+                            }))
+                            return
+                        end
+                        dialog:onClose()
+                        UIManager:close(dialog)
+                        NetworkMgr:runWhenOnline(function()
+                            Trapper:wrap(function()
+                                Trapper:info(_("Creating Zotero item…"))
+                                local key, err = ZoteroAPI.createLinkedBookItem({
+                                    title = title,
+                                    authors = authors,
+                                    date = date,
+                                    file_path = file_path,
+                                })
+                                if not key then
+                                    Trapper:info(_("Could not add to Zotero: ") .. tostring(err or "?"))
+                                    if opts.on_cancel then
+                                        opts.on_cancel()
+                                    end
+                                    return
+                                end
+                                Trapper:info(_("Added to Zotero as a linked file."))
+                                if opts.on_success then
+                                    opts.on_success(key)
+                                end
+                            end)
+                        end)
+                    end,
+                },
+            },
+        },
+    })
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+function Plugin:promptUnlinkedAnnotation(ui, file_path, ann)
+    if self._unlinked_dialog_open then
+        return
+    end
+    self._unlinked_dialog_open = true
+    local Ann = getAnnotationsMod()
+    local under_vault = ZoteroAPI.isPathUnderLinkedBase(file_path)
+    local dialog
+    local function applyLocalOnly()
+        self._unlinked_dialog_open = false
+        local mode = ZoteroAPI.getAnnotationDestinationNonZotero()
+        ann.zoteroDestination = Ann and Ann.DEST_LOCAL or "local"
+        if string.lower(file_path):match("%.pdf$") then
+            setHighlightWriteIntoPdf(file_path, mode == "local")
+        end
+        if ui and ui.doc_settings and ui.annotation then
+            pcall(function()
+                ui.doc_settings:saveSetting("annotations", ui.annotation.annotations)
+                ui.doc_settings:flush()
+            end)
+        end
+    end
+    local buttons = {}
+    if under_vault then
+        table.insert(buttons, {
+            {
+                text = _("Add to Zotero…"),
+                callback = function()
+                    UIManager:close(dialog)
+                    self._unlinked_dialog_open = false
+                    self:showAddLinkedBookDialog(file_path, ui, {
+                        on_success = function()
+                            -- Resume normal destination flow now that the file is linked
+                            if ZoteroAPI.getAnnotationDestinationAsk() then
+                                self:applyDestinationToAnnotation(
+                                    ui,
+                                    ann,
+                                    ZoteroAPI.getAnnotationDestinationLast()
+                                )
+                                UIManager:scheduleIn(0.25, function()
+                                    self:promptAnnotationDestination(ui, ann)
+                                end)
+                            else
+                                self:applyDestinationToAnnotation(
+                                    ui,
+                                    ann,
+                                    ZoteroAPI.getAnnotationDestinationDefault()
+                                )
+                            end
+                            UIManager:scheduleIn(2.5, function()
+                                self:syncOpenDocumentAnnotations(ui, {
+                                    notify = false,
+                                    reload = false,
+                                    file_path = file_path,
+                                })
+                            end)
+                        end,
+                        on_cancel = applyLocalOnly,
+                    })
+                end,
+            },
+        })
+        table.insert(buttons, {
+            {
+                text = _("Keep local only"),
+                callback = function()
+                    UIManager:close(dialog)
+                    applyLocalOnly()
+                end,
+            },
+        })
+    else
+        table.insert(buttons, {
+            {
+                text = _("OK"),
+                callback = function()
+                    UIManager:close(dialog)
+                    applyLocalOnly()
+                end,
+            },
+        })
+    end
+    dialog = ButtonDialog:new({
+        title = under_vault
+                and _("This document is not in Zotero yet.")
+            or _("This document is not linked to Zotero. Annotation stays local."),
+        buttons = buttons,
+    })
+    UIManager:show(dialog)
+end
+
 -- Called by KOReader when highlights/notes change.
 -- Must return immediately: KOReader opens the note dialog only after this handler finishes.
 -- Heavy work (attachment lookup, destination, Zotero upload) runs on the next UI ticks.
@@ -1051,6 +1435,7 @@ function Plugin:onAnnotationsModified(items)
     local added = (items.nb_highlights_added or 0) + (items.nb_notes_added or 0)
     local ui = self.ui
     local file_path = ui.document.file
+    self._annot_dirty = true
 
     -- Local deletion: flush sidecar then record pending deletes + sync soon.
     -- items[1] is the removed annotation (still carries zoteroKey) — use it so we
@@ -1241,18 +1626,9 @@ function Plugin:handleAnnotationAddedDeferred(ui, file_path, items, added)
         ZoteroAPI.rememberAttachmentKeyForPath(file_path, key)
     end
     if not key then
-        local mode = ZoteroAPI.getAnnotationDestinationNonZotero()
-        local Ann = getAnnotationsMod()
-        ann.zoteroDestination = Ann and Ann.DEST_LOCAL or "local"
-        if string.lower(file_path):match("%.pdf$") then
-            setHighlightWriteIntoPdf(file_path, mode == "local")
-        end
-        UIManager:scheduleIn(0.05, function()
-            if ui.doc_settings and ui.annotation then
-                pcall(function()
-                    ui.doc_settings:saveSetting("annotations", ui.annotation.annotations)
-                    ui.doc_settings:flush()
-                end)
+        UIManager:scheduleIn(0.2, function()
+            if ui and ui.document and ui.document.file == file_path then
+                self:promptUnlinkedAnnotation(ui, file_path, ann)
             end
         end)
         return
@@ -1307,10 +1683,12 @@ function Plugin:onReaderReady(readerui)
     local file_path = readerui.document.file
     configureZoteroDocumentSettings(file_path)
     applyDefaultHighlightToOpenReader(readerui)
+    self:applyDisplayRestyle(readerui)
     -- onReadSettings may run around the same time — re-apply so saved_* sticks
     UIManager:scheduleIn(0.4, function()
         if readerui and readerui.document and readerui.document.file == file_path then
             applyDefaultHighlightToOpenReader(readerui)
+            self:applyDisplayRestyle(readerui)
         end
     end)
 
@@ -1337,6 +1715,15 @@ function Plugin:onReaderReady(readerui)
         return
     end
     ZoteroAPI.rememberAttachmentKeyForPath(file_path, key)
+    -- Upgrade attachments: paths to absolute desktop paths (library style) when possible
+    UIManager:scheduleIn(1.5, function()
+        if not networkIsOnline() then
+            return
+        end
+        pcall(function()
+            ZoteroAPI.healLinkedAttachmentPath(file_path, key)
+        end)
+    end)
     local item = ZoteroAPI.getItem(key)
     if not item then
         return
@@ -1381,7 +1768,10 @@ function Plugin:onReaderReady(readerui)
             logger.err("Zotero: Failed to attach annotations on reader open: ", err)
         end
     end
-    -- Upload local create/edit/delete shortly after open (sidecar may have pending changes)
+    -- Keep dirty if a previous offline session queued this path
+    self._annot_dirty = ZoteroAPI.isAnnotSyncPending(file_path)
+    -- Upload local create/edit/delete shortly after open (sidecar may have pending changes).
+    -- Offline: syncOpenDocumentAnnotations defers silently (no WiFi prompt).
     UIManager:scheduleIn(1.0, function()
         self:syncOpenDocumentAnnotations(readerui, { notify = false })
     end)
@@ -1401,29 +1791,32 @@ function Plugin:onCloseDocument()
             end)
         end
     end
-    if file_path then
-        self:syncOpenDocumentAnnotations(self.ui, {
-            notify = false,
-            reload = false,
-            file_path = file_path,
-        })
+    -- Close must stay snappy: do NOT run a full bidirectional sync here.
+    -- Flush is enough for KOReader; push local creates/updates/deletes after teardown.
+    -- (Edits already schedule a sync while the book is open.)
+    if file_path and self._annot_dirty then
+        local gen = self._annot_sync_gen
+        UIManager:scheduleIn(0.9, function()
+            -- Cancelled if another document opened or a newer close cycle started
+            if gen ~= self._annot_sync_gen then
+                return
+            end
+            if not self._annot_dirty then
+                return
+            end
+            self:syncOpenDocumentAnnotations(nil, {
+                notify = false,
+                reload = false,
+                file_path = file_path,
+                push_only = true,
+            })
+        end)
     end
 end
 
 function Plugin:onCloseWidget()
-    self._annot_sync_gen = (self._annot_sync_gen or 0) + 1
-    -- Same as close document: never reload a dying reader
-    local file_path = nil
-    if self.ui and self.ui.document then
-        file_path = self.ui.document.file
-    end
-    if file_path then
-        self:syncOpenDocumentAnnotations(self.ui, {
-            notify = false,
-            reload = false,
-            file_path = file_path,
-        })
-    end
+    -- Do not sync again and do not bump _annot_sync_gen here:
+    -- onCloseDocument may have scheduled a deferred push that must still run.
 end
 
 function Plugin:init()
@@ -1450,7 +1843,25 @@ function Plugin:init()
         logger.warn("Zotero Atelier: menu_tab.lua unavailable; dedicated tab not installed")
     end
 
+    if self.initialized then
+        pcall(function()
+            self:applyDisplayRestyle(self.ui)
+        end)
+    end
+
     logger.info("Zotero Atelier: initialized (ok=" .. tostring(self.initialized) .. ")")
+
+    -- Rewrite attachments: paths created earlier into absolute desktop paths (library style)
+    if self.initialized then
+        UIManager:scheduleIn(4.0, function()
+            if not networkIsOnline() then
+                return
+            end
+            pcall(function()
+                ZoteroAPI.healAllAttachmentsPrefixedPaths()
+            end)
+        end)
+    end
 
     -- One-shot ADB/debug: put absolute path in zotero/_debug_sync_path then restart KOReader
     if self.initialized then
@@ -1708,7 +2119,22 @@ function Plugin:getZoteroSubMenu()
                     return self.ui ~= nil and self.ui.document ~= nil
                 end,
                 callback = function()
-                    self:syncOpenDocumentAnnotations(self.ui, { notify = true })
+                    self:syncOpenDocumentAnnotations(self.ui, {
+                        notify = true,
+                        prompt_wifi = true,
+                    })
+                end,
+            },
+            {
+                text = _("Add to Zotero…"),
+                enabled_func = function()
+                    local fp = self.ui and self.ui.document and self.ui.document.file
+                    -- Path-only check: avoid full attachment DB scan on menu open
+                    return fp ~= nil and ZoteroAPI.isPathUnderLinkedBase(fp)
+                end,
+                callback = function()
+                    local fp = self.ui and self.ui.document and self.ui.document.file
+                    self:showAddLinkedBookDialog(fp, self.ui)
                 end,
             },
             {
@@ -1880,6 +2306,17 @@ function Plugin:getZoteroSubMenu()
                                         configureZoteroDocumentSettings(self.ui.document.file)
                                         applyDefaultHighlightToOpenReader(self.ui)
                                     end
+                                end,
+                            },
+                            {
+                                text = _("Show underlines as squiggly black"),
+                                checked_func = function()
+                                    return ZoteroAPI.getDisplaySquigglyBlack()
+                                end,
+                                callback = function()
+                                    ZoteroAPI.toggleDisplaySquigglyBlack()
+                                    ZoteroAPI.saveSettingsToFile()
+                                    self:applyDisplayRestyle(self.ui)
                                 end,
                             },
                         },
@@ -2285,7 +2722,22 @@ function Plugin:showPluginHub()
             text = _("Sync document annotations"),
             enabled = self.ui ~= nil and self.ui.document ~= nil,
             callback = function()
-                self:syncOpenDocumentAnnotations(self.ui, { notify = true })
+                self:syncOpenDocumentAnnotations(self.ui, {
+                    notify = true,
+                    prompt_wifi = true,
+                })
+            end,
+        },
+        {
+            text = _("Add to Zotero…"),
+            enabled = (function()
+                local fp = self.ui and self.ui.document and self.ui.document.file
+                -- Path-only check: avoid full attachment DB scan on hub build
+                return fp ~= nil and ZoteroAPI.isPathUnderLinkedBase(fp)
+            end)(),
+            callback = function()
+                local fp = self.ui and self.ui.document and self.ui.document.file
+                self:showAddLinkedBookDialog(fp, self.ui)
             end,
         },
         {
