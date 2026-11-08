@@ -1,13 +1,54 @@
-# Zotero Atelier pour KOReader
+<div align="center" id="head">
+
+
+<table>
+<tr>
+<td><img src="readme-media/logo_zoteroatelier.png" alt="Zoteroatelier" width="140" /></td>
+<td align="left">
+<h1 style="margin:0">Zoteroatelier</h1>
+<p style="margin:0.25em 0 0"><strong>Bibliothèque Zotero · Annotations · KOReader</strong><br/>Plugin · sync API · PDF / EPUB · fichiers locaux</p>
+</td>
+</tr>
+</table>
+
+<a href="https://atelier.atechnologie.fr/" title="l'Atelier – Association de fabrication de livres et d'outils de recherche"><img src="https://raw.githubusercontent.com/Atelier-Recherche/.github/main/profile/logo.jpg" alt="l'Atelier" width="200" /></a>  
+<sub>Développé par <a href="https://atelier.atechnologie.fr/">l'Atelier</a> — fabrication de livres et outils de recherche (EHESS)</sub>
+
+<p>
+🇫🇷 <a href="README.md"><b>Français</b></a> ·
+🇬🇧 <a href="README.en.md">English</a> ·
+🇩🇪 <a href="README.de.md">Deutsch</a> ·
+🇪🇸 <a href="README.es.md">Español</a>
+</p>
+
+<p>
+<a href="https://atelier.atechnologie.fr/"><img src="https://img.shields.io/badge/🌐_l'Atelier-atelier.atechnologie.fr-2d5016?style=for-the-badge" alt="Site l'Atelier" /></a>
+<a href="https://github.com/Atelier-Recherche/zoteroatelier.koplugin"><img src="https://img.shields.io/badge/📦_Dépôt-GitHub-181717?style=for-the-badge&logo=github" alt="Dépôt GitHub" /></a>
+</p>
+
+</div>
+
+---
+
+## 📸 Aperçu
+
+| Bibliothèque | Annotations |
+| :---: | :---: |
+| <img src="readme-media/screen1.jpg" alt="Zoteroatelier — bibliothèque" width="400" /> | <img src="readme-media/screen2.jpg" alt="Zoteroatelier — annotations" width="400" /> |
+
+---
+
+## 📖 À propos
 
 Plugin [KOReader](https://github.com/koreader/koreader) pour parcourir votre bibliothèque Zotero, ouvrir les pièces jointes, annoter (PDF / EPUB) et synchroniser les notes avec Zotero — y compris hors WebDAV.
 
-> [!NOTE]
 > Projet repris et développé sous le nom **Zotero Atelier** (fork / continuation du plugin Zotero pour KOReader). Version bêta : les retours et PR sont les bienvenus.
 
-English version: [README.en.md](README.en.md)
+Page outil : [atelier.atechnologie.fr/outil/zoteroatelier-koreader](https://atelier.atechnologie.fr/outil/zoteroatelier-koreader/)
 
-## Fonctionnalités
+---
+
+## ✨ Fonctionnalités
 
 * Synchronisation via l’API Web Zotero
 * Ouverture des pièces jointes PDF / EPUB / HTML
@@ -27,7 +68,9 @@ English version: [README.en.md](README.en.md)
 * Sur EPUB, le positionnement exact type CFI Zotero n’est pas toujours parfait : texte, note et page/chapitre sont synchronisés en priorité
 * Si vous activez à la fois l’écriture dans le PDF et la sync Zotero, les surlignages peuvent apparaître en double selon les viewers
 
-## Installation
+---
+
+## ⬇️ Installation
 
 1. Utilisez une version récente de KOReader
 2. Copiez le dossier du plugin (voir ci-dessous — **le nom doit finir par `.koplugin`**)
@@ -41,7 +84,6 @@ English version: [README.en.md](README.en.md)
 Le dossier **doit** s’appeler exactement `zoteroatelier.koplugin`  
 (pas `zotero.koplugin`, pas `zoteroatelier.koplugin-master`, pas un dossier imbriqué).
 
-> [!IMPORTANT]
 > Un ZIP GitHub s’appelle souvent `zoteroatelier.koplugin-master`.  
 > **Renommez-le** en `zoteroatelier.koplugin` après extraction.  
 > KOReader ignore tout dossier qui ne se termine pas exactement par `.koplugin`.
@@ -95,7 +137,9 @@ Après un redémarrage complet :
 5. Android : `/sdcard/koreader/plugins/zoteroatelier.koplugin`
 6. Ouvrez `crash.log` (répertoire data KOReader) et cherchez `zoteroatelier` / `Error when loading`
 
-## Utilisation
+---
+
+## ✏️ Utilisation
 
 Le plugin conserve la plupart des métadonnées en local. Hormis **Synchronize** (et le téléchargement d’un fichier manquant), il évite d’appeler le serveur.
 
@@ -164,7 +208,7 @@ Version du plugin et statistiques de la bibliothèque locale.
 
 ---
 
-## Configuration
+## ⚙️ Configuration
 
 ### WebDAV
 
@@ -207,7 +251,27 @@ Réglage global KOReader : Réglages → Document → Save document (write highl
 
 ---
 
-## Crédits
+## 📜 Provenance
 
 Basé sur le plugin Zotero pour KOReader (communauté / forks successifs).  
-**Zotero Atelier** — reprise et extensions (annotations, notes, fichiers locaux).
+**Zotero Atelier** — reprise et extensions (annotations, notes, fichiers locaux) par [l'Atelier](https://atelier.atechnologie.fr/).
+
+---
+
+## 🔗 Ressources
+
+| | |
+| --- | --- |
+| 🌐 **l'Atelier** | [atelier.atechnologie.fr](https://atelier.atechnologie.fr/) |
+| 🛠️ **Page outil** | [zoteroatelier-koreader](https://atelier.atechnologie.fr/outil/zoteroatelier-koreader/) |
+| 📦 **Dépôt** | [github.com/Atelier-Recherche/zoteroatelier.koplugin](https://github.com/Atelier-Recherche/zoteroatelier.koplugin) |
+| 📖 **KOReader** | [github.com/koreader/koreader](https://github.com/koreader/koreader) |
+| 📚 **Zotero** | [zotero.org](https://www.zotero.org/) |
+
+---
+
+<div align="center">
+
+<sub>🇫🇷 <a href="README.md">Français</a> · <a href="README.en.md">🇬🇧 English</a> · <a href="README.de.md">🇩🇪 Deutsch</a> · <a href="README.es.md">🇪🇸 Español</a> · Zoteroatelier — <a href="https://atelier.atechnologie.fr/">l'Atelier</a></sub>
+
+</div>
