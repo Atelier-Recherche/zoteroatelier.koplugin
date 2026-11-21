@@ -27,7 +27,25 @@ local ZoteroAPI = require("zoteroapi")
 
 local AnnotationPanel = {}
 
+local function loadPdfEmbedded(plugin)
+    local ok, mod = pcall(require, "pdf_embedded_annotations")
+    if ok and mod then
+        return mod
+    end
+    if plugin and plugin.path then
+        local path = plugin.path .. "/pdf_embedded_annotations.lua"
+        local ok2, mod2 = pcall(dofile, path)
+        if ok2 and mod2 then
+            return mod2
+        end
+    end
+    return nil
+end
+
 local function sourceBadge(ann)
+    if ann._fromPdfEmbedded then
+        return "[PDF] "
+    end
     if ann.zoteroKey and ann._fromDbOnly then
         return "[Z] "
     end
@@ -190,7 +208,7 @@ local function gotoAnnotation(ui, ann)
     return ok
 end
 
-local function buildUnifiedList(ui, file_path)
+local function buildUnifiedList(ui, file_path, plugin)
     local list = collectLocalAnnotations(ui, file_path)
     local seen_keys = {}
     for _, ann in ipairs(list) do
@@ -224,6 +242,21 @@ local function buildUnifiedList(ui, file_path)
             end
         end
     end
+
+    -- Embedded PDF markup (Acrobat / BOOX / …) not yet in the sidecar
+    local PdfEmb = loadPdfEmbedded(plugin)
+    if PdfEmb and ui and ui.document and ui.document.is_pdf then
+        local ok_e, embedded = pcall(PdfEmb.list, ui)
+        if ok_e and type(embedded) == "table" then
+            embedded = PdfEmb.dedupeAgainstLocal(embedded, list)
+            for _, emb in ipairs(embedded) do
+                table.insert(list, emb)
+            end
+        elseif not ok_e then
+            logger.warn("Zotero: list embedded PDF annots failed: ", embedded)
+        end
+    end
+
     return list, attachment_key
 end
 
@@ -272,11 +305,15 @@ function AnnotationPanel.show(ui, opts)
     end
 
     local filter = opts.filter or ""
-    local annotations = buildUnifiedList(ui, file_path)
+    local annotations = buildUnifiedList(ui, file_path, opts.plugin)
     local items = {}
+    local pdf_embedded_count = 0
 
     for i, ann in ipairs(annotations) do
         if matchesFilter(ann, filter) then
+            if ann._fromPdfEmbedded then
+                pdf_embedded_count = pdf_embedded_count + 1
+            end
             table.insert(items, {
                 text = annotationLabel(ann),
                 ann = ann,
@@ -297,13 +334,18 @@ function AnnotationPanel.show(ui, opts)
                     "Check Local files path mapping (avoid .stversions)."
                 )
         end
+        local empty_msg = _(
+            "No annotations in this document.\n\nTo create one: select text in the book, choose Highlight (or Add note), then use « Sync document annotations »."
+        )
+        if ui.document and ui.document.is_pdf then
+            empty_msg = empty_msg
+                .. "\n\n"
+                .. _(
+                    "Tip: some readers (e.g. BOOX) keep highlights only in their own database until they are written/exported into the PDF file."
+                )
+        end
         UIManager:show(InfoMessage:new({
-            text = filter ~= "" and _("No matching annotations.")
-                or (
-                    _(
-                        "No annotations in this document.\n\nTo create one: select text in the book, choose Highlight (or Add note), then use « Sync document annotations »."
-                    ) .. hint
-                ),
+            text = filter ~= "" and _("No matching annotations.") or (empty_msg .. hint),
             timeout = 6,
         }))
         return
@@ -328,12 +370,17 @@ function AnnotationPanel.show(ui, opts)
         AnnotationPanel.show(ui, { filter = new_filter or filter, plugin = opts.plugin })
     end
 
+    local title = _("Document annotations")
+        .. " ("
+        .. #items
+        .. ")"
+        .. (filter ~= "" and (" - " .. filter) or "")
+    if pdf_embedded_count > 0 then
+        title = title .. " · PDF " .. tostring(pdf_embedded_count)
+    end
+
     menu = Menu:new({
-        title = _("Document annotations")
-            .. " ("
-            .. #items
-            .. ")"
-            .. (filter ~= "" and (" - " .. filter) or ""),
+        title = title,
         item_table = items,
         is_borderless = not use_side,
         is_popout = not use_side,
@@ -344,36 +391,65 @@ function AnnotationPanel.show(ui, opts)
         title_bar_left_icon = "appbar.search",
         onLeftButtonTap = function()
             local dialog
+            local buttons = {
+                {
+                    {
+                        text = _("Cancel"),
+                        callback = function()
+                            UIManager:close(dialog)
+                        end,
+                    },
+                    {
+                        text = _("Clear"),
+                        callback = function()
+                            UIManager:close(dialog)
+                            reopen("")
+                        end,
+                    },
+                    {
+                        text = _("Filter"),
+                        is_enter_default = true,
+                        callback = function()
+                            local q = dialog:getInputText()
+                            UIManager:close(dialog)
+                            reopen(q)
+                        end,
+                    },
+                },
+            }
+            if attachment_key and pdf_embedded_count > 0 and opts.plugin
+                and opts.plugin.migratePdfEmbeddedToZotero
+            then
+                table.insert(buttons, {
+                    {
+                        text = _("Convert all PDF annotations to Zotero"),
+                        callback = function()
+                            UIManager:close(dialog)
+                            closePanel()
+                            local to_migrate = {}
+                            for _, it in ipairs(items) do
+                                if it.ann and it.ann._fromPdfEmbedded then
+                                    table.insert(to_migrate, it.ann)
+                                end
+                            end
+                            opts.plugin:migratePdfEmbeddedToZotero(ui, to_migrate, {
+                                notify = true,
+                                on_done = function()
+                                    AnnotationPanel.show(ui, {
+                                        filter = filter,
+                                        plugin = opts.plugin,
+                                    })
+                                end,
+                            })
+                        end,
+                    },
+                })
+            end
             dialog = InputDialog:new({
                 title = _("Filter annotations"),
                 input = filter,
                 input_hint = _("text, note, page…"),
-                buttons = {
-                    {
-                        {
-                            text = _("Cancel"),
-                            callback = function()
-                                UIManager:close(dialog)
-                            end,
-                        },
-                        {
-                            text = _("Clear"),
-                            callback = function()
-                                UIManager:close(dialog)
-                                reopen("")
-                            end,
-                        },
-                        {
-                            text = _("Filter"),
-                            is_enter_default = true,
-                            callback = function()
-                                local q = dialog:getInputText()
-                                UIManager:close(dialog)
-                                reopen(q)
-                            end,
-                        },
-                    },
-                },
+                buttons = buttons,
             })
             UIManager:show(dialog)
             dialog:onShowKeyboard()
@@ -395,6 +471,112 @@ function AnnotationPanel.show(ui, opts)
                 }))
                 return true
             end
+
+            -- Embedded PDF annotation actions
+            if item.ann and item.ann._fromPdfEmbedded then
+                local PdfEmb = loadPdfEmbedded(opts.plugin)
+                local dialog
+                local rows = {
+                    {
+                        {
+                            text = _("Go to page"),
+                            callback = function()
+                                UIManager:close(dialog)
+                                closePanel()
+                                gotoAnnotation(ui, item.ann)
+                            end,
+                        },
+                    },
+                }
+                if attachment_key and opts.plugin and opts.plugin.migratePdfEmbeddedToZotero then
+                    table.insert(rows, {
+                        {
+                            text = _("Convert to Zotero"),
+                            callback = function()
+                                UIManager:close(dialog)
+                                closePanel()
+                                opts.plugin:migratePdfEmbeddedToZotero(ui, { item.ann }, {
+                                    notify = true,
+                                    on_done = function()
+                                        AnnotationPanel.show(ui, {
+                                            filter = filter,
+                                            plugin = opts.plugin,
+                                        })
+                                    end,
+                                })
+                            end,
+                        },
+                    })
+                end
+                table.insert(rows, {
+                    {
+                        text = _("Delete from PDF"),
+                        callback = function()
+                            UIManager:close(dialog)
+                            local confirm
+                            confirm = ButtonDialog:new({
+                                title = _("Delete this annotation from the PDF file?"),
+                                buttons = {
+                                    {
+                                        {
+                                            text = _("Cancel"),
+                                            callback = function()
+                                                UIManager:close(confirm)
+                                            end,
+                                        },
+                                        {
+                                            text = _("Delete"),
+                                            callback = function()
+                                                UIManager:close(confirm)
+                                                local ok_del, err
+                                                if PdfEmb then
+                                                    ok_del, err = PdfEmb.deleteFromPdf(ui, item.ann)
+                                                else
+                                                    ok_del, err = false, "module missing"
+                                                end
+                                                closePanel()
+                                                if ok_del then
+                                                    UIManager:show(InfoMessage:new({
+                                                        text = _("Annotation removed from PDF."),
+                                                        timeout = 2,
+                                                    }))
+                                                else
+                                                    UIManager:show(InfoMessage:new({
+                                                        text = _("Could not delete from PDF: ")
+                                                            .. tostring(err),
+                                                        timeout = 4,
+                                                        icon = "notice-warning",
+                                                    }))
+                                                end
+                                                AnnotationPanel.show(ui, {
+                                                    filter = filter,
+                                                    plugin = opts.plugin,
+                                                })
+                                            end,
+                                        },
+                                    },
+                                },
+                            })
+                            UIManager:show(confirm)
+                        end,
+                    },
+                })
+                table.insert(rows, {
+                    {
+                        text = _("Cancel"),
+                        callback = function()
+                            UIManager:close(dialog)
+                        end,
+                    },
+                })
+                dialog = ButtonDialog:new({
+                    title = _("PDF annotation"),
+                    buttons = rows,
+                })
+                UIManager:show(dialog)
+                return true
+            end
+
             local dialog
             dialog = ButtonDialog:new({
                 title = _("Delete this annotation?"),
@@ -411,6 +593,7 @@ function AnnotationPanel.show(ui, opts)
                             callback = function()
                                 UIManager:close(dialog)
                                 local idx = item.ann and item.ann._sidecarIndex or item.index
+                                local ann = item.ann
                                 if ui.annotation and ui.annotation.annotations and idx then
                                     table.remove(ui.annotation.annotations, idx)
                                     if ui.doc_settings then
@@ -420,6 +603,15 @@ function AnnotationPanel.show(ui, opts)
                                         )
                                         ui.doc_settings:flush()
                                     end
+                                end
+                                -- Also remove from PDF if it was written there
+                                if ann and ui.document and ui.document.is_pdf
+                                    and ann.pboxes and ui.highlight
+                                    and ui.highlight.writePdfAnnotation
+                                then
+                                    pcall(function()
+                                        ui.highlight:writePdfAnnotation("delete", ann)
+                                    end)
                                 end
                                 closePanel()
                                 if opts.plugin and opts.plugin.syncOpenDocumentAnnotations then

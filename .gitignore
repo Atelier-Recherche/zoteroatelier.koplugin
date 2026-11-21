@@ -2,3 +2,7 @@
 notes/
 update_koreader.sh
 README.local.md
+build.ps1
+deploy.ps1
+release.ps1
+old/

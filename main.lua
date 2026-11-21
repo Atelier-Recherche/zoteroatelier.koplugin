@@ -985,6 +985,234 @@ function Plugin:syncOpenDocumentAnnotations(readerui, opts)
     end
 end
 
+-- Migrate embedded PDF annotations → Zotero, then delete them from the PDF
+-- only after a successful create (zoteroKey assigned).
+-- embedded_anns: list of tables with _fromPdfEmbedded / pboxes / pageno
+-- opts.on_done: optional callback after finish
+function Plugin:migratePdfEmbeddedToZotero(readerui, embedded_anns, opts)
+    opts = opts or {}
+    if not init_done then
+        return
+    end
+    if not readerui or not readerui.document or not readerui.document.is_pdf then
+        if opts.notify then
+            UIManager:show(InfoMessage:new({
+                text = _("Open a PDF document first."),
+                timeout = 3,
+            }))
+        end
+        return
+    end
+    embedded_anns = embedded_anns or {}
+    if #embedded_anns == 0 then
+        if opts.notify then
+            UIManager:show(InfoMessage:new({
+                text = _("No PDF annotations to convert."),
+                timeout = 3,
+            }))
+        end
+        if opts.on_done then
+            opts.on_done({ ok = 0, fail = 0 })
+        end
+        return
+    end
+
+    local file_path = readerui.document.file
+    local key = ZoteroAPI.findAttachmentKeyByFilePath(file_path)
+    if not key then
+        if opts.notify then
+            UIManager:show(InfoMessage:new({
+                text = _("This file is not linked to a Zotero attachment."),
+                timeout = 3,
+                icon = "notice-warning",
+            }))
+        end
+        return
+    end
+
+    local PdfEmb = loadPluginModule(self, "pdf_embedded_annotations")
+    if not PdfEmb then
+        if opts.notify then
+            UIManager:show(InfoMessage:new({
+                text = _("PDF annotation module unavailable."),
+                timeout = 3,
+                icon = "notice-warning",
+            }))
+        end
+        return
+    end
+
+    if not readerui.annotation then
+        readerui.annotation = { annotations = {} }
+    end
+    if type(readerui.annotation.annotations) ~= "table" then
+        readerui.annotation.annotations = {}
+    end
+
+    local pending = {}
+    for _, emb in ipairs(embedded_anns) do
+        local sid = PdfEmb.toSidecarAnnotation(readerui, emb)
+        if sid and sid.drawer then
+            table.insert(readerui.annotation.annotations, sid)
+            table.insert(pending, {
+                emb = emb,
+                pdf_id = sid._pdfAnnotId or emb._pdfAnnotId,
+                text = sid.text,
+                page = sid.pageno or sid.page,
+            })
+        end
+    end
+
+    if #pending == 0 then
+        if opts.notify then
+            UIManager:show(InfoMessage:new({
+                text = _("Could not prepare PDF annotations for conversion."),
+                timeout = 3,
+                icon = "notice-warning",
+            }))
+        end
+        return
+    end
+
+    pcall(function()
+        if readerui.doc_settings then
+            readerui.doc_settings:saveSetting("annotations", readerui.annotation.annotations)
+            readerui.doc_settings:flush()
+        end
+    end)
+
+    if opts.notify then
+        UIManager:show(InfoMessage:new({
+            text = _("Converting PDF annotations to Zotero…"),
+            timeout = 2,
+        }))
+    end
+
+    local function finish_delete_and_report()
+        -- Prefer sidecar on disk: createAnnotations writes zoteroKey there
+        local anns = {}
+        pcall(function()
+            local ds = DocSettings:open(file_path)
+            anns = ds:readSetting("annotations") or {}
+            pcall(function()
+                ds:close()
+            end)
+        end)
+        -- Merge live zoteroKey if sync mutated the in-memory table
+        if readerui.annotation and type(readerui.annotation.annotations) == "table" then
+            for _, live in ipairs(readerui.annotation.annotations) do
+                if live.zoteroKey then
+                    local matched = false
+                    for _, a in ipairs(anns) do
+                        if a == live or (live._pdfAnnotId and a._pdfAnnotId == live._pdfAnnotId) then
+                            a.zoteroKey = live.zoteroKey
+                            matched = true
+                            break
+                        end
+                    end
+                    if not matched then
+                        table.insert(anns, live)
+                    end
+                end
+            end
+        end
+
+        local function find_created(pend)
+            for _, a in ipairs(anns) do
+                if a.zoteroKey then
+                    if pend.pdf_id and a._pdfAnnotId and a._pdfAnnotId == pend.pdf_id then
+                        return a
+                    end
+                    local ap = tonumber(a.pageno or a.page)
+                    local pp = tonumber(pend.page)
+                    if ap and pp and ap == pp and pend.text and a.text == pend.text then
+                        return a
+                    end
+                end
+            end
+            return nil
+        end
+
+        local ok_n, fail_n = 0, 0
+        for _, pend in ipairs(pending) do
+            local created = find_created(pend)
+            if created then
+                local del_ok, del_err = PdfEmb.deleteFromPdf(readerui, pend.emb)
+                if del_ok then
+                    ok_n = ok_n + 1
+                    created._migratedFromPdf = nil
+                else
+                    fail_n = fail_n + 1
+                    logger.warn("Zotero: migrated to Zotero but PDF delete failed: ", del_err)
+                end
+            else
+                fail_n = fail_n + 1
+            end
+        end
+
+        pcall(function()
+            if readerui.doc_settings then
+                readerui.doc_settings:saveSetting("annotations", anns)
+                readerui.doc_settings:flush()
+            end
+            if readerui.annotation then
+                readerui.annotation.annotations = anns
+            end
+        end)
+
+        self:reloadReaderAnnotations(readerui, file_path)
+
+        if opts.notify then
+            local text
+            if fail_n == 0 then
+                text = _("Converted to Zotero and removed from PDF: ") .. tostring(ok_n)
+            else
+                text = _("Converted: ")
+                    .. tostring(ok_n)
+                    .. "\n"
+                    .. _("Failed (kept in PDF): ")
+                    .. tostring(fail_n)
+            end
+            UIManager:show(InfoMessage:new({
+                text = text,
+                timeout = 5,
+                icon = fail_n > 0 and "notice-warning" or "notice-info",
+            }))
+        end
+        if opts.on_done then
+            opts.on_done({ ok = ok_n, fail = fail_n })
+        end
+    end
+
+    local function run_migrate_sync()
+        local item = ZoteroAPI.getItem(key)
+        local ok, err = pcall(function()
+            if item then
+                pcall(ZoteroAPI.setAttachmentVersionByKey, key, item.version or 1)
+            end
+            -- push_only: do not pull/replace before our new locals are uploaded
+            ZoteroAPI.syncAnnotationsForAttachment(key, file_path, { push_only = true })
+        end)
+        if not ok then
+            logger.err("Zotero: PDF→Zotero migrate sync failed: ", err)
+            if opts.notify then
+                UIManager:show(InfoMessage:new({
+                    text = _("Annotation sync failed: ") .. tostring(err),
+                    timeout = 5,
+                    icon = "notice-warning",
+                }))
+            end
+            if opts.on_done then
+                opts.on_done({ ok = 0, fail = #pending })
+            end
+            return
+        end
+        finish_delete_and_report()
+    end
+
+    NetworkMgr:runWhenOnline(run_migrate_sync)
+end
+
 function Plugin:applyDestinationToAnnotation(ui, ann, dest, opts)
     if ann == nil then
         return
