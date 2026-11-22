@@ -724,14 +724,6 @@ function AnnotationPanel.show(ui, opts)
     local embedded = {}
     local pdf_pct = 0
 
-    local function paintSoon()
-        pcall(function()
-            if UIManager.forceRePaint then
-                UIManager:forceRePaint()
-            end
-        end)
-    end
-
     local function rebuildMerged(status_suffix, show_placeholder)
         if closed or not ui or not ui.document or ui.document.file ~= file_path then
             return
@@ -763,8 +755,8 @@ function AnnotationPanel.show(ui, opts)
         if not show_placeholder and pdf_embedded_count > 0 then
             suffix = "PDF " .. tostring(pdf_embedded_count)
         end
+        -- Title/items only — no forceRePaint (triggers ANR dialogs on e-ink).
         refreshMenu(menu, items, filter, suffix)
-        paintSoon()
     end
 
     UIManager:scheduleIn(0.05, function()
@@ -772,16 +764,15 @@ function AnnotationPanel.show(ui, opts)
             return
         end
         refreshMenu(menu, items, filter, _("Looking up Zotero…"))
-        paintSoon()
 
         local ok_key, key_or_err = pcall(ZoteroAPI.findAttachmentKeyByFilePath, file_path)
+        if closed then
+            return
+        end
         if ok_key then
             attachment_key = key_or_err
         end
         zotero_done = true
-        if closed then
-            return
-        end
         if attachment_key then
             UIManager:scheduleIn(0.2, function()
                 if not closed and ui and ui.document and ui.document.file == file_path then
@@ -793,7 +784,7 @@ function AnnotationPanel.show(ui, opts)
         if not pdf_done then
             status = string.format(_("Scanning PDF… %d%%"), pdf_pct)
         end
-        rebuildMerged(status, not zotero_done or not pdf_done)
+        rebuildMerged(status, not pdf_done)
     end)
 
     if is_pdf then
@@ -803,17 +794,18 @@ function AnnotationPanel.show(ui, opts)
             end
             local PdfEmb = loadPdfEmbedded(opts.plugin)
             if not PdfEmb or type(PdfEmb.listAsync) ~= "function" then
-                if PdfEmb then
+                if PdfEmb and not closed then
                     local ok_e, res = pcall(PdfEmb.list, ui)
                     if ok_e and type(res) == "table" then
                         embedded = res
                     end
                 end
                 pdf_done = true
-                rebuildMerged(nil, not zotero_done)
+                if not closed then
+                    rebuildMerged(nil, not zotero_done)
+                end
                 return
             end
-            local last_paint_pct = -10
             PdfEmb.listAsync(ui, {
                 cancelled = function()
                     return closed
@@ -826,18 +818,13 @@ function AnnotationPanel.show(ui, opts)
                         return
                     end
                     pdf_pct = pct or 0
-                    -- Throttle e-ink repaints (every ~8%).
-                    if pdf_pct - last_paint_pct < 8 and pdf_pct < 100 then
-                        return
-                    end
-                    last_paint_pct = pdf_pct
-                    local label = string.format(
-                        _("Scanning PDF… %d%% (%d)"),
-                        pdf_pct,
-                        annot_count or 0
+                    -- Title only, no full rebuild / force paint.
+                    refreshMenu(
+                        menu,
+                        items,
+                        filter,
+                        string.format(_("Scanning PDF… %d%% (%d)"), pdf_pct, annot_count or 0)
                     )
-                    refreshMenu(menu, items, filter, label)
-                    paintSoon()
                 end,
                 on_done = function(list)
                     if closed then

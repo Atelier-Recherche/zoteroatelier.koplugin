@@ -12,7 +12,8 @@ local PdfEmbedded = {}
 
 -- Cache: path -> { mtime=number, size=number, list=table }
 local _list_cache = {}
-local CHUNK_OBJS = 280
+-- Bump when scan algorithm changes so stale disk entries are ignored.
+local CACHE_ALGO = 2
 
 -- MuPDF annot types: highlight=8, underline=9, squiggly=10, strikeout=11
 local TYPE_TO_DRAWER = {
@@ -420,6 +421,7 @@ local function writeDiskCache(file_path, mtime, size, list)
         file = file_path,
         mtime = mtime,
         size = size,
+        algo = CACHE_ALGO,
         list = serializeListForCache(list),
     }
     local ok, encoded = pcall(JSON.encode, payload)
@@ -453,6 +455,9 @@ local function readDiskCache(file_path, mtime, size)
         return nil
     end
     if payload.file ~= file_path or payload.mtime ~= mtime or payload.size ~= size then
+        return nil
+    end
+    if payload.algo ~= CACHE_ALGO then
         return nil
     end
     if type(payload.list) ~= "table" then
@@ -521,110 +526,85 @@ local function parseMarkupFromBody(obj_num, body)
     }
 end
 
-local function maybeIndexArrayObj(obj_num, body, array_objs)
-    local trimmed = body:match("^%s*(%[)")
-    if not trimmed then
-        return
+-- Last definition of object N (incremental PDFs). Avoids full-file object walks.
+local function extractObjectBody(data, obj_num)
+    if not data or not obj_num then
+        return nil
     end
-    -- Indirect Annots arrays are bare [ N 0 R … ] objects.
-    if body:find("/Type%s*/", 1) or body:find("/Subtype%s*/", 1) then
-        return
-    end
-    local refs = {}
-    for ref in body:gmatch("(%d+)%s+0%s+R") do
-        table.insert(refs, tonumber(ref))
-    end
-    if #refs > 0 then
-        array_objs[obj_num] = refs
-    end
-end
-
-local function bodyWorthIndexing(body)
-    if not body then
-        return false
-    end
-    if body:match("^%s*%[") then
-        return true
-    end
-    if body:find("/Type%s*/Catalog", 1)
-        or body:find("/Type%s*/Pages", 1)
-        or body:find("/Type%s*/Page[%s/>]", 1)
-        or body:find("/Kids", 1, true)
-        or body:find("/Annots", 1, true)
-        or body:find("/Pages%s+", 1)
-        or body:find("/Subtype%s*/", 1)
-        or body:find("/onyxtag", 1, true)
-    then
-        return true
-    end
-    return false
-end
-
--- Index one PDF object (last write wins for incremental updates).
-local function ingestObject(obj_num, body, state)
-    if bodyWorthIndexing(body) then
-        state.obj_bodies[obj_num] = body
-        maybeIndexArrayObj(obj_num, body, state.array_objs)
-    end
-    local ann = parseMarkupFromBody(obj_num, body)
-    if ann then
-        -- Replace prior definition of same obj_num if re-saved.
-        local replaced = false
-        for i, prev in ipairs(state.results) do
-            if prev.obj_num == obj_num then
-                state.results[i] = ann
-                replaced = true
+    local needle = tostring(obj_num) .. " 0 obj"
+    local pos = 1
+    local last_body = nil
+    while true do
+        local s, e = data:find(needle, pos, true)
+        if not s then
+            break
+        end
+        -- Reject longer numbers (e.g. 19909 matching 9909).
+        local prev = s > 1 and data:byte(s - 1) or nil
+        if prev and prev >= 48 and prev <= 57 then
+            pos = e + 1
+        else
+            local end_s = data:find("endobj", e + 1, true)
+            if not end_s then
                 break
             end
-        end
-        if not replaced then
-            table.insert(state.results, ann)
+            last_body = data:sub(e + 1, end_s - 1)
+            pos = end_s + 6
         end
     end
-    state.objs_seen = (state.objs_seen or 0) + 1
+    return last_body
 end
 
--- Walk up to CHUNK_OBJS objects from state.pos; returns true if more remain.
-local function walkObjectChunk(state, limit)
-    local data = state.data
-    local n = 0
-    limit = limit or CHUNK_OBJS
-    while n < limit do
-        local s, e, obj_num = data:find("(%d+)%s+0%s+obj", state.pos)
+local function findObjNumBefore(data, at)
+    local start = math.max(1, at - 8000)
+    local chunk = data:sub(start, at - 1)
+    local last_num = nil
+    local pos = 1
+    while true do
+        local s, e, num = chunk:find("(%d+)%s+0%s+obj", pos)
         if not s then
-            state.pos = #data + 1
-            return false
+            break
         end
-        local end_s = data:find("endobj", e + 1, true)
-        if not end_s then
-            state.pos = #data + 1
-            return false
-        end
-        local body = data:sub(e + 1, end_s - 1)
-        state.pos = end_s + 6
-        ingestObject(tonumber(obj_num), body, state)
-        n = n + 1
+        last_num = tonumber(num)
+        pos = e + 1
     end
-    return state.pos <= #data
+    return last_num
 end
 
-local function findCatalogRoot(data, obj_bodies)
-    local last_root = nil
-    for root in data:gmatch("/Root%s+(%d+)%s+0%s+R") do
-        last_root = tonumber(root)
-    end
-    if last_root and obj_bodies[last_root] then
-        return last_root
-    end
-    for num, body in pairs(obj_bodies) do
-        if body:find("/Type%s*/Catalog", 1) then
-            return num
+local MARKUP_KINDS = { "Squiggly", "Highlight", "Underline", "StrikeOut" }
+
+-- Targeted markup discovery: O(hits), not O(all PDF objects).
+local function findMarkupAnnots(data)
+    local results = {}
+    local seen = {}
+    for _, kind in ipairs(MARKUP_KINDS) do
+        local needles = { "/Subtype /" .. kind, "/Subtype/" .. kind }
+        for _, needle in ipairs(needles) do
+            local pos = 1
+            while true do
+                local found = data:find(needle, pos, true)
+                if not found then
+                    break
+                end
+                pos = found + #needle
+                local obj_num = findObjNumBefore(data, found)
+                if obj_num and not seen[obj_num] then
+                    local body = extractObjectBody(data, obj_num)
+                    if body then
+                        local ann = parseMarkupFromBody(obj_num, body)
+                        if ann then
+                            seen[obj_num] = true
+                            table.insert(results, ann)
+                        end
+                    end
+                end
+            end
         end
     end
-    return nil
+    return results
 end
 
-local function kidsRefList(body, obj_bodies, array_objs)
+local function kidsRefBlob(body, data)
     if not body then
         return nil
     end
@@ -633,96 +613,123 @@ local function kidsRefList(body, obj_bodies, array_objs)
         return kids
     end
     local iref = body:match("/Kids%s+(%d+)%s+0%s+R")
-    if not iref then
-        return nil
-    end
-    local n = tonumber(iref)
-    local arr = array_objs and array_objs[n]
-    if arr then
-        local parts = {}
-        for _, r in ipairs(arr) do
-            table.insert(parts, tostring(r) .. " 0 R")
+    if iref then
+        local ab = extractObjectBody(data, tonumber(iref))
+        if ab then
+            return ab:match("%[([^%]]*)%]") or ab
         end
-        return table.concat(parts, " ")
-    end
-    local ab = obj_bodies and obj_bodies[n]
-    if ab then
-        return ab:match("%[([^%]]*)%]") or ab
     end
     return nil
 end
 
-local function flattenPageTree(obj_bodies, obj_num, out, visited, array_objs)
-    if not obj_num or visited[obj_num] then
-        return
+-- page_obj_num -> 1-based page index from the live /Pages tree only.
+-- Flat /Kids (common): no per-page body extract. Nested trees: recurse sparsely.
+local function buildPageIndex(data)
+    local page_index = {}
+    local last_root = nil
+    for root in data:gmatch("/Root%s+(%d+)%s+0%s+R") do
+        last_root = tonumber(root)
     end
-    visited[obj_num] = true
-    local body = obj_bodies[obj_num]
-    if not body then
-        return
+    if not last_root then
+        return page_index
     end
-    local kids = kidsRefList(body, obj_bodies, array_objs)
-    if kids then
-        for ref in kids:gmatch("(%d+)%s+0%s+R") do
-            flattenPageTree(obj_bodies, tonumber(ref), out, visited, array_objs)
-        end
-    else
-        table.insert(out, obj_num)
+    local cat = extractObjectBody(data, last_root)
+    local pages_ref = cat and cat:match("/Pages%s+(%d+)%s+0%s+R")
+    if not pages_ref then
+        return page_index
     end
-end
 
-local function annotRefsFromPageBody(body, array_objs)
-    local refs = {}
-    local inline = body:match("/Annots%s*%[([^%]]*)%]")
-    if inline then
-        for ref in inline:gmatch("(%d+)%s+0%s+R") do
+    local function collectKids(obj_num, out, visited)
+        if not obj_num or visited[obj_num] then
+            return
+        end
+        visited[obj_num] = true
+        local body = extractObjectBody(data, obj_num)
+        if not body then
+            return
+        end
+        local kids = kidsRefBlob(body, data)
+        if not kids then
+            table.insert(out, obj_num)
+            return
+        end
+        local refs = {}
+        for ref in kids:gmatch("(%d+)%s+0%s+R") do
             table.insert(refs, tonumber(ref))
         end
-        return refs
-    end
-    local iref = body:match("/Annots%s*(%d+)%s+0%s+R")
-    if iref then
-        local arr = array_objs[tonumber(iref)]
-        if arr then
-            for _, r in ipairs(arr) do
-                table.insert(refs, r)
+        if #refs == 0 then
+            return
+        end
+        -- Probe first child: nested /Pages node vs leaf /Page.
+        local first_body = extractObjectBody(data, refs[1])
+        local nested = first_body and kidsRefBlob(first_body, data)
+        if nested then
+            for _, r in ipairs(refs) do
+                collectKids(r, out, visited)
+            end
+        else
+            for _, r in ipairs(refs) do
+                table.insert(out, r)
             end
         end
     end
-    return refs
+
+    local page_objs = {}
+    collectKids(tonumber(pages_ref), page_objs, {})
+    for i, pobj in ipairs(page_objs) do
+        page_index[pobj] = i
+    end
+    return page_index
 end
 
--- Map annot obj → 1-based page via /Root → /Pages → /Kids (ignores stale Page objs).
-local function mapPagesFromTree(state)
+local function isDigitByte(b)
+    return b and b >= 48 and b <= 57
+end
+
+-- Reverse map: find which live page's /Annots references each annot obj.
+local function mapAnnotsToPages(data, results, page_index)
     local obj_to_page = {}
-    local root = findCatalogRoot(state.data, state.obj_bodies)
-    if not root then
-        return obj_to_page, 0
-    end
-    local cat = state.obj_bodies[root]
-    local pages_ref = cat and cat:match("/Pages%s+(%d+)%s+0%s+R")
-    if not pages_ref then
-        return obj_to_page, 0
-    end
-    local page_objs = {}
-    flattenPageTree(state.obj_bodies, tonumber(pages_ref), page_objs, {}, state.array_objs)
-    for page_i, page_obj in ipairs(page_objs) do
-        local body = state.obj_bodies[page_obj]
-        if body then
-            local refs = annotRefsFromPageBody(body, state.array_objs)
-            for _, ref in ipairs(refs) do
-                local nested = state.array_objs[ref]
-                if nested then
-                    for _, a in ipairs(nested) do
-                        obj_to_page[a] = page_i
+    for _, ann in ipairs(results) do
+        local anum = ann.obj_num
+        if anum then
+            local needle = tostring(anum) .. " 0 R"
+            local pos = 1
+            while not obj_to_page[anum] do
+                local s, e = data:find(needle, pos, true)
+                if not s then
+                    break
+                end
+                pos = e + 1
+                if not (s > 1 and isDigitByte(data:byte(s - 1))) then
+                    local container = findObjNumBefore(data, s)
+                    if container and page_index[container] then
+                        obj_to_page[anum] = page_index[container]
+                    elseif container then
+                        -- Indirect Annots array: find /Annots <container> 0 R on a live page.
+                        local cref = tostring(container) .. " 0 R"
+                        local p2 = 1
+                        while not obj_to_page[anum] do
+                            local s2, e2 = data:find(cref, p2, true)
+                            if not s2 then
+                                break
+                            end
+                            p2 = e2 + 1
+                            if not (s2 > 1 and isDigitByte(data:byte(s2 - 1))) then
+                                local win = data:sub(math.max(1, s2 - 48), s2 - 1)
+                                if win:find("/Annots", 1, true) then
+                                    local pobj = findObjNumBefore(data, s2)
+                                    if pobj and page_index[pobj] then
+                                        obj_to_page[anum] = page_index[pobj]
+                                    end
+                                end
+                            end
+                        end
                     end
-                else
-                    obj_to_page[ref] = page_i
                 end
             end
         end
     end
-    return obj_to_page, #page_objs
+    return obj_to_page
 end
 
 local function applyPageMap(results, obj_to_page, doc_page_count)
@@ -747,26 +754,22 @@ local function docPageCount(ui)
     return nil
 end
 
--- Walk PDF objects for markup annots, then map obj → page via page tree.
-function PdfEmbedded.scanFile(file_path, ui)
-    local data = readFileBinary(file_path)
+local function scanData(data, ui)
     if not data or #data == 0 then
         return {}
     end
-    local state = {
-        data = data,
-        pos = 1,
-        obj_bodies = {},
-        array_objs = {},
-        results = {},
-        objs_seen = 0,
-    }
-    while walkObjectChunk(state, 1000000) do
-        -- sync: drain all chunks
-    end
-    local obj_to_page = mapPagesFromTree(state)
-    applyPageMap(state.results, obj_to_page, docPageCount(ui))
-    return state.results
+    local results = findMarkupAnnots(data)
+    local page_index = buildPageIndex(data)
+    local obj_to_page = mapAnnotsToPages(data, results, page_index)
+    applyPageMap(results, obj_to_page, docPageCount(ui))
+    return results
+end
+
+-- Targeted scan: subtype hits + /Pages tree index + reverse /Annots map.
+-- Never walks every PDF object (that freezes e-ink for tens of seconds).
+function PdfEmbedded.scanFile(file_path, ui)
+    local data = readFileBinary(file_path)
+    return scanData(data, ui)
 end
 
 local function listFromDocumentApi(document)
@@ -1055,13 +1058,20 @@ function PdfEmbedded.list(ui)
     return unique
 end
 
---- Cooperative chunked scan. opts: on_progress(pct, annot_count), on_done(list), cancelled()
+--- Async scan without freezing the UI. opts: on_progress(pct, n), on_done(list), cancelled()
+-- Fast path is targeted (not a full object walk); work is split across a few ticks.
 function PdfEmbedded.listAsync(ui, opts)
     opts = opts or {}
     local on_progress = opts.on_progress
     local on_done = opts.on_done
     local cancelled = opts.cancelled
+    local function isCancelled()
+        return cancelled and cancelled()
+    end
     local function done(list)
+        if isCancelled() then
+            return
+        end
         if on_done then
             on_done(list or {})
         end
@@ -1075,7 +1085,7 @@ function PdfEmbedded.listAsync(ui, opts)
     local size = fileSize(file_path)
     local hit = tryLoadCachedList(file_path, mtime, size)
     if hit then
-        if on_progress then
+        if on_progress and not isCancelled() then
             on_progress(100, #hit)
         end
         done(hit)
@@ -1083,52 +1093,52 @@ function PdfEmbedded.listAsync(ui, opts)
     end
 
     local UIManager = require("ui/uimanager")
-    local data = readFileBinary(file_path)
-    if not data or #data == 0 then
-        done({})
-        return
-    end
-    local state = {
-        data = data,
-        pos = 1,
-        obj_bodies = {},
-        array_objs = {},
-        results = {},
-        objs_seen = 0,
-        file_path = file_path,
-        mtime = mtime,
-        size = size,
-        data_len = #data,
-    }
-
-    local function tick()
-        if cancelled and cancelled() then
+    UIManager:scheduleIn(0, function()
+        if isCancelled() then
             return
         end
-        local more = walkObjectChunk(state, CHUNK_OBJS)
-        local pct = math.min(99, math.floor((state.pos / math.max(1, state.data_len)) * 90))
         if on_progress then
-            on_progress(pct, #state.results)
+            on_progress(10, 0)
         end
-        if more then
-            UIManager:scheduleIn(0, tick)
+        local data = readFileBinary(file_path)
+        if isCancelled() then
             return
         end
-        -- Resolve pages on tree (fast once objects are indexed).
-        if on_progress then
-            on_progress(95, #state.results)
+        if not data or #data == 0 then
+            done({})
+            return
         end
-        local obj_to_page = mapPagesFromTree(state)
-        applyPageMap(state.results, obj_to_page, docPageCount(ui))
-        local unique = finalizeScannedList(ui, state.results)
-        storeListCache(file_path, mtime, size, unique)
         if on_progress then
-            on_progress(100, #unique)
+            on_progress(40, 0)
         end
-        done(unique)
-    end
-
-    UIManager:scheduleIn(0, tick)
+        -- Yield once after read so the panel can paint / close.
+        UIManager:scheduleIn(0, function()
+            if isCancelled() then
+                return
+            end
+            local ok_scan, scanned = pcall(scanData, data, ui)
+            if isCancelled() then
+                return
+            end
+            if not ok_scan then
+                logger.warn("Zotero: PDF embedded scan failed: ", scanned)
+                done({})
+                return
+            end
+            if on_progress then
+                on_progress(80, #(scanned or {}))
+            end
+            local unique = finalizeScannedList(ui, scanned or {})
+            if isCancelled() then
+                return
+            end
+            storeListCache(file_path, mtime, size, unique)
+            if on_progress then
+                on_progress(100, #unique)
+            end
+            done(unique)
+        end)
+    end)
 end
 
 function PdfEmbedded.clearCache(file_path)
