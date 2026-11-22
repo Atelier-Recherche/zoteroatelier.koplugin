@@ -192,8 +192,21 @@ return {
     ["Converted to Zotero and removed from PDF: "] = "Converties vers Zotero et retirées du PDF : ",
     ["Converted: "] = "Converties : ",
     ["Failed (kept in PDF): "] = "Échecs (conservées dans le PDF) : ",
-    ["Tip: some readers (e.g. BOOX) keep highlights only in their own database until they are written/exported into the PDF file."] =
-        "Astuce : certains lecteurs (ex. BOOX) gardent les surlignages uniquement dans leur base tant qu’ils ne sont pas écrits/exportés dans le fichier PDF.",
+    ["Tip: some apps keep highlights outside the PDF until they are written or exported into the file itself."] =
+        "Astuce : certaines applis gardent les surlignages hors du PDF tant qu’ils ne sont pas écrits ou exportés dans le fichier lui-même.",
+    ["Not linked to Zotero"] = "Non lié à Zotero",
+    ["This file is not linked to a Zotero attachment.\nConversion to Zotero is unavailable."] =
+        "Ce fichier n’est pas lié à une pièce jointe Zotero.\nLa conversion vers Zotero est indisponible.",
+    ["Could not open annotation actions."] = "Impossible d’ouvrir les actions d’annotation.",
+    ["Scanning PDF…"] = "Scan PDF…",
+    ["Scanning PDF… %d%%"] = "Scan PDF… %d%%",
+    ["Scanning PDF… %d%% (%d)"] = "Scan PDF… %d%% (%d)",
+    ["Scanning PDF annotations…"] = "Scan des annotations PDF…",
+    ["Page"] = "Page",
+    ["Loading…"] = "Chargement…",
+    ["Looking up Zotero…"] = "Recherche Zotero…",
+    ["Could not find this annotation’s page in the document."] =
+        "Impossible de trouver la page de cette annotation dans le document.",
     ["(empty)"] = "(vide)",
     ["text, comment, title..."] = "texte, commentaire, titre…",
     ["Search highlights and notes across the synchronized Zotero library."] = "Recherche les surlignages et notes dans la bibliothèque Zotero synchronisée.",

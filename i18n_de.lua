@@ -191,8 +191,21 @@ return {
     ["Converted to Zotero and removed from PDF: "] = "Nach Zotero konvertiert und aus PDF entfernt: ",
     ["Converted: "] = "Konvertiert: ",
     ["Failed (kept in PDF): "] = "Fehlgeschlagen (im PDF belassen): ",
-    ["Tip: some readers (e.g. BOOX) keep highlights only in their own database until they are written/exported into the PDF file."] =
-        "Tipp: Manche Reader (z. B. BOOX) speichern Markierungen nur in ihrer eigenen Datenbank, bis sie in die PDF-Datei geschrieben/exportiert werden.",
+    ["Tip: some apps keep highlights outside the PDF until they are written or exported into the file itself."] =
+        "Tipp: Manche Apps speichern Markierungen außerhalb der PDF, bis sie in die Datei selbst geschrieben oder exportiert werden.",
+    ["Not linked to Zotero"] = "Nicht mit Zotero verknüpft",
+    ["This file is not linked to a Zotero attachment.\nConversion to Zotero is unavailable."] =
+        "Diese Datei ist nicht mit einem Zotero-Anhang verknüpft.\nKonvertierung nach Zotero nicht verfügbar.",
+    ["Could not open annotation actions."] = "Annotationsaktionen konnten nicht geöffnet werden.",
+    ["Scanning PDF…"] = "PDF-Scan…",
+    ["Scanning PDF… %d%%"] = "PDF-Scan… %d%%",
+    ["Scanning PDF… %d%% (%d)"] = "PDF-Scan… %d%% (%d)",
+    ["Scanning PDF annotations…"] = "PDF-Annotationen werden gescannt…",
+    ["Page"] = "Seite",
+    ["Loading…"] = "Laden…",
+    ["Looking up Zotero…"] = "Zotero wird gesucht…",
+    ["Could not find this annotation’s page in the document."] =
+        "Die Seite dieser Annotation konnte im Dokument nicht gefunden werden.",
     ["(empty)"] = "(leer)",
     ["text, comment, title..."] = "Text, Kommentar, Titel…",
     ["Search highlights and notes across the synchronized Zotero library."] = "Markierungen und Notizen in der synchronisierten Zotero-Bibliothek suchen.",

@@ -64,9 +64,62 @@ local function truncate(s, max_len)
     return s:sub(1, max_len - 1) .. "..."
 end
 
+-- Keep only ASCII + valid UTF-8; replace anything else with '?' so FreeType
+-- never crashes when painting Menu / dialogs.
+local function safeText(s)
+    if s == nil then
+        return ""
+    end
+    s = tostring(s)
+    local out = {}
+    local i, n = 1, #s
+    while i <= n do
+        local c = s:byte(i)
+        if c < 0x80 then
+            if c >= 32 or c == 9 or c == 10 then
+                out[#out + 1] = string.char(c)
+            else
+                out[#out + 1] = "?"
+            end
+            i = i + 1
+        elseif c >= 0xC2 and c <= 0xDF and i + 1 <= n then
+            local c2 = s:byte(i + 1)
+            if c2 >= 0x80 and c2 <= 0xBF then
+                out[#out + 1] = s:sub(i, i + 1)
+                i = i + 2
+            else
+                out[#out + 1] = "?"
+                i = i + 1
+            end
+        elseif c >= 0xE0 and c <= 0xEF and i + 2 <= n then
+            local c2, c3 = s:byte(i + 1, i + 2)
+            if c2 >= 0x80 and c2 <= 0xBF and c3 >= 0x80 and c3 <= 0xBF then
+                out[#out + 1] = s:sub(i, i + 2)
+                i = i + 3
+            else
+                out[#out + 1] = "?"
+                i = i + 1
+            end
+        elseif c >= 0xF0 and c <= 0xF4 and i + 3 <= n then
+            local c2, c3, c4 = s:byte(i + 1, i + 3)
+            if c2 >= 0x80 and c2 <= 0xBF and c3 >= 0x80 and c3 <= 0xBF and c4 >= 0x80 and c4 <= 0xBF then
+                out[#out + 1] = s:sub(i, i + 3)
+                i = i + 4
+            else
+                out[#out + 1] = "?"
+                i = i + 1
+            end
+        else
+            out[#out + 1] = "?"
+            i = i + 1
+        end
+    end
+    return table.concat(out)
+end
+
 local function annotationLabel(ann)
     local page = ann.pageno or ann.page or "?"
-    local text = ann.note or ann.text or _("(no text)")
+    local text = safeText(ann.note or ann.text or _("(no text)"))
     return sourceBadge(ann) .. "p." .. tostring(page) .. " - " .. truncate(text, 70)
 end
 
@@ -189,79 +242,172 @@ local function collectLocalAnnotations(ui, file_path)
     return ordered
 end
 
-local function gotoAnnotation(ui, ann)
-    if ui == nil or ann == nil then
-        return
+-- Menu may call onMenuChoice(item) OR self:onMenuChoice(item).
+local function menuItemArg(a, b)
+    if type(b) == "table" and (b.ann ~= nil or b.text ~= nil) then
+        return b
+    end
+    if type(a) == "table" and (a.ann ~= nil or a.text ~= nil) then
+        return a
+    end
+    return b or a
+end
+
+local function documentPageCount(ui)
+    if ui and ui.document and ui.document.info then
+        return tonumber(ui.document.info.number_of_pages)
+    end
+    return nil
+end
+
+-- Trust scan/sidecar pageno only; never findText (slow + wrong on OCR PDFs).
+local function resolveAnnotationPage(ui, ann)
+    if ann == nil then
+        return nil
     end
     local page = tonumber(ann.pageno or ann.page)
-    local ok = pcall(function()
-        if page and ui.paging and ui.paging.onGotoPage then
-            ui.paging:onGotoPage(page)
-        elseif page and ui.link and ui.link.onGotoPage then
-            ui.link:onGotoPage(page)
-        elseif ann.pos0 and ann.pos0.xpointer and ui.link and ui.link.onGotoXPointer then
+    if not page or page < 1 then
+        return nil
+    end
+    local max_page = documentPageCount(ui)
+    if max_page and page > max_page then
+        return nil
+    end
+    return page
+end
+
+local function gotoAnnotation(ui, ann)
+    if ui == nil or ann == nil then
+        return false
+    end
+    if ann.pos0 and ann.pos0.xpointer and ui.link and ui.link.onGotoXPointer then
+        local ok = pcall(function()
             ui.link:onGotoXPointer(ann.pos0.xpointer)
-        elseif page and ui.document and ui.document.gotoPage then
+        end)
+        if ok then
+            return true
+        end
+    end
+    local page = resolveAnnotationPage(ui, ann)
+    if not page then
+        UIManager:show(InfoMessage:new({
+            text = _("Could not find this annotation’s page in the document."),
+            timeout = 3,
+        }))
+        return false
+    end
+    local ok = pcall(function()
+        if ui.paging and ui.paging.onGotoPage then
+            ui.paging:onGotoPage(page)
+        elseif ui.link and ui.link.onGotoPage then
+            ui.link:onGotoPage(page)
+        elseif ui.document and ui.document.gotoPage then
             ui.document:gotoPage(page)
+        else
+            error("no goto page API")
         end
     end)
     return ok
 end
 
-local function buildUnifiedList(ui, file_path, plugin)
-    local list = collectLocalAnnotations(ui, file_path)
+-- Sidecar / live reader only — must stay instant (no DB, no PDF I/O).
+local function buildLocalOnlyList(ui, file_path)
+    return collectLocalAnnotations(ui, file_path)
+end
+
+local function appendZoteroDbAnnotations(list, attachment_key)
+    if not attachment_key then
+        return list
+    end
     local seen_keys = {}
     for _, ann in ipairs(list) do
         if ann.zoteroKey then
             seen_keys[ann.zoteroKey] = true
         end
     end
-
-    local attachment_key = nil
-    pcall(function()
-        attachment_key = ZoteroAPI.findAttachmentKeyByFilePath(file_path)
-    end)
-    if attachment_key then
-        local ok, db_rows = pcall(ZoteroAPI.listAttachmentAnnotations, attachment_key)
-        if ok and db_rows then
-            for _, row in ipairs(db_rows) do
-                if row.key and not seen_keys[row.key] then
-                    table.insert(list, {
-                        zoteroKey = row.key,
-                        text = row.text,
-                        note = row.comment ~= "" and row.comment or nil,
-                        page = row.page ~= "" and tonumber(row.page) or row.page,
-                        pageno = row.page ~= "" and tonumber(row.page) or nil,
-                        color = row.color,
-                        zoteroVersion = row.version,
-                        _fromDbOnly = true,
-                        drawer = "lighten",
-                    })
-                    seen_keys[row.key] = true
-                end
+    local ok, db_rows = pcall(ZoteroAPI.listAttachmentAnnotations, attachment_key)
+    if ok and db_rows then
+        for _, row in ipairs(db_rows) do
+            if row.key and not seen_keys[row.key] then
+                table.insert(list, {
+                    zoteroKey = row.key,
+                    text = row.text,
+                    note = row.comment ~= "" and row.comment or nil,
+                    page = row.page ~= "" and tonumber(row.page) or row.page,
+                    pageno = row.page ~= "" and tonumber(row.page) or nil,
+                    color = row.color,
+                    zoteroVersion = row.version,
+                    _fromDbOnly = true,
+                    drawer = "lighten",
+                })
+                seen_keys[row.key] = true
             end
         end
     end
+    return list
+end
 
-    -- Embedded PDF markup (Acrobat / BOOX / …) not yet in the sidecar
+local function appendPdfEmbedded(list, plugin, ui, embedded)
+    if type(embedded) ~= "table" then
+        return list
+    end
     local PdfEmb = loadPdfEmbedded(plugin)
-    if PdfEmb and ui and ui.document and ui.document.is_pdf then
-        local ok_e, embedded = pcall(PdfEmb.list, ui)
-        if ok_e and type(embedded) == "table" then
-            embedded = PdfEmb.dedupeAgainstLocal(embedded, list)
-            for _, emb in ipairs(embedded) do
-                table.insert(list, emb)
+    if PdfEmb and PdfEmb.dedupeAgainstLocal then
+        embedded = PdfEmb.dedupeAgainstLocal(embedded, list)
+    end
+    for _, emb in ipairs(embedded) do
+        table.insert(list, emb)
+    end
+    return list
+end
+
+local function annotationsToItems(annotations, filter)
+    local items = {}
+    local pdf_embedded_count = 0
+    for i, ann in ipairs(annotations) do
+        if matchesFilter(ann, filter) then
+            if ann._fromPdfEmbedded then
+                pdf_embedded_count = pdf_embedded_count + 1
             end
-        elseif not ok_e then
-            logger.warn("Zotero: list embedded PDF annots failed: ", embedded)
+            table.insert(items, {
+                text = annotationLabel(ann),
+                ann = ann,
+                index = ann._sidecarIndex or i,
+            })
         end
     end
+    return items, pdf_embedded_count
+end
 
-    return list, attachment_key
+local function panelTitle(count, filter, status_suffix)
+    local title = _("Document annotations") .. " (" .. tostring(count) .. ")"
+    if filter ~= nil and filter ~= "" then
+        title = title .. " - " .. filter
+    end
+    if status_suffix and status_suffix ~= "" then
+        title = title .. " · " .. status_suffix
+    end
+    return title
+end
+
+local function refreshMenu(menu, items, filter, status_suffix)
+    if not menu then
+        return
+    end
+    local title = panelTitle(#items, filter, status_suffix)
+    if menu.switchItemTable then
+        pcall(function()
+            menu:switchItemTable(title, items)
+        end)
+    end
 end
 
 local function ensureAttached(ui, file_path, attachment_key)
     if not attachment_key then
+        return
+    end
+    -- Avoid re-attaching on every panel open (freezes on large libraries).
+    if ui and ui._zotero_panel_attached_key == attachment_key then
         return
     end
     local item = ZoteroAPI.getItem(attachment_key)
@@ -273,6 +419,10 @@ local function ensureAttached(ui, file_path, attachment_key)
     end)
     if not ok then
         logger.err("Zotero: panel attach failed: ", err)
+        return
+    end
+    if ui then
+        ui._zotero_panel_attached_key = attachment_key
     end
     if ui and ui.doc_settings and file_path then
         local ds = DocSettings:open(file_path)
@@ -296,68 +446,31 @@ function AnnotationPanel.show(ui, opts)
     end
 
     local file_path = ui.document.file
-    local attachment_key = nil
-    pcall(function()
-        attachment_key = ZoteroAPI.findAttachmentKeyByFilePath(file_path)
-    end)
-    if attachment_key then
-        ensureAttached(ui, file_path, attachment_key)
-    end
-
     local filter = opts.filter or ""
-    local annotations = buildUnifiedList(ui, file_path, opts.plugin)
-    local items = {}
+    local is_pdf = ui.document.is_pdf and true or false
+
+    -- INSTANT: sidecar/live only. Never touch Zotero DB or PDF here
+    -- (findAttachmentKeyByFilePath can take tens of seconds on large libraries).
+    local annotations = buildLocalOnlyList(ui, file_path)
+    local items = annotationsToItems(annotations, filter)
+    local attachment_key = nil
     local pdf_embedded_count = 0
 
-    for i, ann in ipairs(annotations) do
-        if matchesFilter(ann, filter) then
-            if ann._fromPdfEmbedded then
-                pdf_embedded_count = pdf_embedded_count + 1
-            end
-            table.insert(items, {
-                text = annotationLabel(ann),
-                ann = ann,
-                index = ann._sidecarIndex or i,
-            })
-        end
-    end
-
-    if #items == 0 then
-        local hint = ""
-        if not attachment_key then
-            hint = "\n\n"
-                .. _(
-                    "This file is not linked to a Zotero attachment."
-                )
-                .. "\n"
-                .. _(
-                    "Check Local files path mapping (avoid .stversions)."
-                )
-        end
-        local empty_msg = _(
-            "No annotations in this document.\n\nTo create one: select text in the book, choose Highlight (or Add note), then use « Sync document annotations »."
-        )
-        if ui.document and ui.document.is_pdf then
-            empty_msg = empty_msg
-                .. "\n\n"
-                .. _(
-                    "Tip: some readers (e.g. BOOX) keep highlights only in their own database until they are written/exported into the PDF file."
-                )
-        end
-        UIManager:show(InfoMessage:new({
-            text = filter ~= "" and _("No matching annotations.") or (empty_msg .. hint),
-            timeout = 6,
-        }))
-        return
-    end
+    table.insert(items, 1, {
+        text = "… " .. _("Loading…"),
+        ann = { _scanningPlaceholder = true },
+        index = 0,
+    })
 
     local use_side = ZoteroAPI.getLargeScreenAnnotationPanel() and ZoteroAPI.isLargeScreen()
     local panel_w = use_side and math.floor(Screen:getWidth() * 0.38) or nil
     local panel_h = use_side and Screen:getHeight() or nil
 
-    local shell -- RightContainer when side panel; nil for popout
+    local shell
     local menu
+    local closed = false
     local function closePanel()
+        closed = true
         if shell then
             UIManager:close(shell)
         elseif menu then
@@ -370,17 +483,8 @@ function AnnotationPanel.show(ui, opts)
         AnnotationPanel.show(ui, { filter = new_filter or filter, plugin = opts.plugin })
     end
 
-    local title = _("Document annotations")
-        .. " ("
-        .. #items
-        .. ")"
-        .. (filter ~= "" and (" - " .. filter) or "")
-    if pdf_embedded_count > 0 then
-        title = title .. " · PDF " .. tostring(pdf_embedded_count)
-    end
-
     menu = Menu:new({
-        title = title,
+        title = panelTitle(#items, filter, _("Loading…")),
         item_table = items,
         is_borderless = not use_side,
         is_popout = not use_side,
@@ -391,195 +495,10 @@ function AnnotationPanel.show(ui, opts)
         title_bar_left_icon = "appbar.search",
         onLeftButtonTap = function()
             local dialog
-            local buttons = {
-                {
-                    {
-                        text = _("Cancel"),
-                        callback = function()
-                            UIManager:close(dialog)
-                        end,
-                    },
-                    {
-                        text = _("Clear"),
-                        callback = function()
-                            UIManager:close(dialog)
-                            reopen("")
-                        end,
-                    },
-                    {
-                        text = _("Filter"),
-                        is_enter_default = true,
-                        callback = function()
-                            local q = dialog:getInputText()
-                            UIManager:close(dialog)
-                            reopen(q)
-                        end,
-                    },
-                },
-            }
-            if attachment_key and pdf_embedded_count > 0 and opts.plugin
-                and opts.plugin.migratePdfEmbeddedToZotero
-            then
-                table.insert(buttons, {
-                    {
-                        text = _("Convert all PDF annotations to Zotero"),
-                        callback = function()
-                            UIManager:close(dialog)
-                            closePanel()
-                            local to_migrate = {}
-                            for _, it in ipairs(items) do
-                                if it.ann and it.ann._fromPdfEmbedded then
-                                    table.insert(to_migrate, it.ann)
-                                end
-                            end
-                            opts.plugin:migratePdfEmbeddedToZotero(ui, to_migrate, {
-                                notify = true,
-                                on_done = function()
-                                    AnnotationPanel.show(ui, {
-                                        filter = filter,
-                                        plugin = opts.plugin,
-                                    })
-                                end,
-                            })
-                        end,
-                    },
-                })
-            end
             dialog = InputDialog:new({
                 title = _("Filter annotations"),
                 input = filter,
                 input_hint = _("text, note, page…"),
-                buttons = buttons,
-            })
-            UIManager:show(dialog)
-            dialog:onShowKeyboard()
-        end,
-        onMenuChoice = function(_, item)
-            closePanel()
-            if item.ann and item.ann._fromDbOnly and attachment_key then
-                ensureAttached(ui, file_path, attachment_key)
-            end
-            gotoAnnotation(ui, item.ann)
-        end,
-        onMenuHold = function(_, item)
-            if item.ann and item.ann._fromDbOnly then
-                UIManager:show(InfoMessage:new({
-                    text = _(
-                        "This annotation is in Zotero but not yet in the reader.\nUse « Sync document annotations » then reopen this list."
-                    ),
-                    timeout = 4,
-                }))
-                return true
-            end
-
-            -- Embedded PDF annotation actions
-            if item.ann and item.ann._fromPdfEmbedded then
-                local PdfEmb = loadPdfEmbedded(opts.plugin)
-                local dialog
-                local rows = {
-                    {
-                        {
-                            text = _("Go to page"),
-                            callback = function()
-                                UIManager:close(dialog)
-                                closePanel()
-                                gotoAnnotation(ui, item.ann)
-                            end,
-                        },
-                    },
-                }
-                if attachment_key and opts.plugin and opts.plugin.migratePdfEmbeddedToZotero then
-                    table.insert(rows, {
-                        {
-                            text = _("Convert to Zotero"),
-                            callback = function()
-                                UIManager:close(dialog)
-                                closePanel()
-                                opts.plugin:migratePdfEmbeddedToZotero(ui, { item.ann }, {
-                                    notify = true,
-                                    on_done = function()
-                                        AnnotationPanel.show(ui, {
-                                            filter = filter,
-                                            plugin = opts.plugin,
-                                        })
-                                    end,
-                                })
-                            end,
-                        },
-                    })
-                end
-                table.insert(rows, {
-                    {
-                        text = _("Delete from PDF"),
-                        callback = function()
-                            UIManager:close(dialog)
-                            local confirm
-                            confirm = ButtonDialog:new({
-                                title = _("Delete this annotation from the PDF file?"),
-                                buttons = {
-                                    {
-                                        {
-                                            text = _("Cancel"),
-                                            callback = function()
-                                                UIManager:close(confirm)
-                                            end,
-                                        },
-                                        {
-                                            text = _("Delete"),
-                                            callback = function()
-                                                UIManager:close(confirm)
-                                                local ok_del, err
-                                                if PdfEmb then
-                                                    ok_del, err = PdfEmb.deleteFromPdf(ui, item.ann)
-                                                else
-                                                    ok_del, err = false, "module missing"
-                                                end
-                                                closePanel()
-                                                if ok_del then
-                                                    UIManager:show(InfoMessage:new({
-                                                        text = _("Annotation removed from PDF."),
-                                                        timeout = 2,
-                                                    }))
-                                                else
-                                                    UIManager:show(InfoMessage:new({
-                                                        text = _("Could not delete from PDF: ")
-                                                            .. tostring(err),
-                                                        timeout = 4,
-                                                        icon = "notice-warning",
-                                                    }))
-                                                end
-                                                AnnotationPanel.show(ui, {
-                                                    filter = filter,
-                                                    plugin = opts.plugin,
-                                                })
-                                            end,
-                                        },
-                                    },
-                                },
-                            })
-                            UIManager:show(confirm)
-                        end,
-                    },
-                })
-                table.insert(rows, {
-                    {
-                        text = _("Cancel"),
-                        callback = function()
-                            UIManager:close(dialog)
-                        end,
-                    },
-                })
-                dialog = ButtonDialog:new({
-                    title = _("PDF annotation"),
-                    buttons = rows,
-                })
-                UIManager:show(dialog)
-                return true
-            end
-
-            local dialog
-            dialog = ButtonDialog:new({
-                title = _("Delete this annotation?"),
                 buttons = {
                     {
                         {
@@ -589,41 +508,153 @@ function AnnotationPanel.show(ui, opts)
                             end,
                         },
                         {
-                            text = _("Delete"),
+                            text = _("Clear"),
                             callback = function()
                                 UIManager:close(dialog)
-                                local idx = item.ann and item.ann._sidecarIndex or item.index
-                                local ann = item.ann
-                                if ui.annotation and ui.annotation.annotations and idx then
-                                    table.remove(ui.annotation.annotations, idx)
-                                    if ui.doc_settings then
-                                        ui.doc_settings:saveSetting(
-                                            "annotations",
-                                            ui.annotation.annotations
-                                        )
-                                        ui.doc_settings:flush()
-                                    end
-                                end
-                                -- Also remove from PDF if it was written there
-                                if ann and ui.document and ui.document.is_pdf
-                                    and ann.pboxes and ui.highlight
-                                    and ui.highlight.writePdfAnnotation
-                                then
-                                    pcall(function()
-                                        ui.highlight:writePdfAnnotation("delete", ann)
-                                    end)
-                                end
-                                closePanel()
-                                if opts.plugin and opts.plugin.syncOpenDocumentAnnotations then
-                                    opts.plugin:syncOpenDocumentAnnotations(ui, { notify = false })
-                                end
-                                AnnotationPanel.show(ui, { filter = filter, plugin = opts.plugin })
+                                reopen("")
+                            end,
+                        },
+                        {
+                            text = _("Filter"),
+                            is_enter_default = true,
+                            callback = function()
+                                local q = dialog:getInputText()
+                                UIManager:close(dialog)
+                                reopen(q)
                             end,
                         },
                     },
                 },
             })
             UIManager:show(dialog)
+            dialog:onShowKeyboard()
+        end,
+        onMenuChoice = function(a, b)
+            local item = menuItemArg(a, b)
+            if not item or not item.ann or item.ann._scanningPlaceholder then
+                return
+            end
+            closePanel()
+            -- Defer navigation so Menu can finish closing cleanly.
+            local ann_ref = item.ann
+            UIManager:scheduleIn(0.05, function()
+                gotoAnnotation(ui, ann_ref)
+            end)
+        end,
+        onMenuHold = function(a, b)
+            -- MUST return immediately and defer UI: showing a dialog inside the
+            -- hold gesture handler re-enters input/paint and native-crashes KOReader.
+            local item = menuItemArg(a, b)
+            if not item or not item.ann or item.ann._scanningPlaceholder then
+                return true
+            end
+            -- Snapshot plain fields only (no live table mutation during gesture).
+            local ann_ref = item.ann
+            local page_n = tonumber(ann_ref.pageno or ann_ref.page)
+            local from_pdf = ann_ref._fromPdfEmbedded and true or false
+            local from_db = ann_ref._fromDbOnly and true or false
+            local sidecar_index = ann_ref._sidecarIndex or item.index
+            local can_convert = from_pdf
+                and attachment_key
+                and opts.plugin
+                and opts.plugin.migratePdfEmbeddedToZotero
+
+            UIManager:scheduleIn(0.15, function()
+                if closed then
+                    return
+                end
+                local ok_ui, err_ui = pcall(function()
+                    if from_db then
+                        UIManager:show(InfoMessage:new({
+                            text = _(
+                                "This annotation is in Zotero but not yet in the reader.\nUse « Sync document annotations » then reopen this list."
+                            ),
+                            timeout = 4,
+                        }))
+                        return
+                    end
+
+                    local dialog
+                    local rows = {}
+                    -- Always offer go-to: page may be resolved on demand from text.
+                    table.insert(rows, {
+                        {
+                            text = _("Go to page"),
+                            callback = function()
+                                UIManager:close(dialog)
+                                closePanel()
+                                UIManager:scheduleIn(0.05, function()
+                                    gotoAnnotation(ui, ann_ref)
+                                end)
+                            end,
+                        },
+                    })
+                    if can_convert then
+                        table.insert(rows, {
+                            {
+                                text = _("Convert to Zotero"),
+                                callback = function()
+                                    UIManager:close(dialog)
+                                    closePanel()
+                                    opts.plugin:migratePdfEmbeddedToZotero(ui, { ann_ref }, {
+                                        notify = true,
+                                        on_done = function()
+                                            AnnotationPanel.show(ui, {
+                                                filter = filter,
+                                                plugin = opts.plugin,
+                                            })
+                                        end,
+                                    })
+                                end,
+                            },
+                        })
+                    end
+                    if not from_pdf and not from_db then
+                        table.insert(rows, {
+                            {
+                                text = _("Delete"),
+                                callback = function()
+                                    UIManager:close(dialog)
+                                    if ui.annotation and ui.annotation.annotations and sidecar_index then
+                                        pcall(function()
+                                            table.remove(ui.annotation.annotations, sidecar_index)
+                                            if ui.doc_settings then
+                                                ui.doc_settings:saveSetting(
+                                                    "annotations",
+                                                    ui.annotation.annotations
+                                                )
+                                                ui.doc_settings:flush()
+                                            end
+                                        end)
+                                    end
+                                    closePanel()
+                                    AnnotationPanel.show(ui, {
+                                        filter = filter,
+                                        plugin = opts.plugin,
+                                    })
+                                end,
+                            },
+                        })
+                    end
+                    table.insert(rows, {
+                        {
+                            text = _("Cancel"),
+                            callback = function()
+                                UIManager:close(dialog)
+                            end,
+                        },
+                    })
+                    -- Fixed translated title only — never annotation body text.
+                    dialog = ButtonDialog:new({
+                        title = _("Annotation"),
+                        buttons = rows,
+                    })
+                    UIManager:show(dialog)
+                end)
+                if not ok_ui then
+                    logger.err("Zotero: deferred hold UI failed: ", err_ui)
+                end
+            end)
             return true
         end,
         close_callback = function()
@@ -676,6 +707,148 @@ function AnnotationPanel.show(ui, opts)
         UIManager:show(shell)
     else
         UIManager:show(menu)
+    end
+
+    -- Force a paint so the user sees the panel before heavy work.
+    pcall(function()
+        if UIManager.forceRePaint then
+            UIManager:forceRePaint()
+        elseif UIManager.repaintEntireScreen then
+            UIManager:repaintEntireScreen()
+        end
+    end)
+
+    -- Parallel background: Zotero lookup + chunked PDF scan (each refreshes when ready).
+    local zotero_done = false
+    local pdf_done = not is_pdf
+    local embedded = {}
+    local pdf_pct = 0
+
+    local function paintSoon()
+        pcall(function()
+            if UIManager.forceRePaint then
+                UIManager:forceRePaint()
+            end
+        end)
+    end
+
+    local function rebuildMerged(status_suffix, show_placeholder)
+        if closed or not ui or not ui.document or ui.document.file ~= file_path then
+            return
+        end
+        local list = buildLocalOnlyList(ui, file_path)
+        if attachment_key then
+            list = appendZoteroDbAnnotations(list, attachment_key)
+        end
+        if pdf_done then
+            list = appendPdfEmbedded(list, opts.plugin, ui, embedded)
+        end
+        items, pdf_embedded_count = annotationsToItems(list, filter)
+        if show_placeholder then
+            table.insert(items, 1, {
+                text = "… " .. (status_suffix or _("Loading…")),
+                ann = { _scanningPlaceholder = true },
+                index = 0,
+            })
+        elseif #items == 0 then
+            items = {
+                {
+                    text = _("No annotations in this document."),
+                    ann = { _scanningPlaceholder = true },
+                    index = 0,
+                },
+            }
+        end
+        local suffix = status_suffix
+        if not show_placeholder and pdf_embedded_count > 0 then
+            suffix = "PDF " .. tostring(pdf_embedded_count)
+        end
+        refreshMenu(menu, items, filter, suffix)
+        paintSoon()
+    end
+
+    UIManager:scheduleIn(0.05, function()
+        if closed or not ui or not ui.document or ui.document.file ~= file_path then
+            return
+        end
+        refreshMenu(menu, items, filter, _("Looking up Zotero…"))
+        paintSoon()
+
+        local ok_key, key_or_err = pcall(ZoteroAPI.findAttachmentKeyByFilePath, file_path)
+        if ok_key then
+            attachment_key = key_or_err
+        end
+        zotero_done = true
+        if closed then
+            return
+        end
+        if attachment_key then
+            UIManager:scheduleIn(0.2, function()
+                if not closed and ui and ui.document and ui.document.file == file_path then
+                    pcall(ensureAttached, ui, file_path, attachment_key)
+                end
+            end)
+        end
+        local status = nil
+        if not pdf_done then
+            status = string.format(_("Scanning PDF… %d%%"), pdf_pct)
+        end
+        rebuildMerged(status, not zotero_done or not pdf_done)
+    end)
+
+    if is_pdf then
+        UIManager:scheduleIn(0.05, function()
+            if closed or not ui or not ui.document or ui.document.file ~= file_path then
+                return
+            end
+            local PdfEmb = loadPdfEmbedded(opts.plugin)
+            if not PdfEmb or type(PdfEmb.listAsync) ~= "function" then
+                if PdfEmb then
+                    local ok_e, res = pcall(PdfEmb.list, ui)
+                    if ok_e and type(res) == "table" then
+                        embedded = res
+                    end
+                end
+                pdf_done = true
+                rebuildMerged(nil, not zotero_done)
+                return
+            end
+            local last_paint_pct = -10
+            PdfEmb.listAsync(ui, {
+                cancelled = function()
+                    return closed
+                        or not ui
+                        or not ui.document
+                        or ui.document.file ~= file_path
+                end,
+                on_progress = function(pct, annot_count)
+                    if closed then
+                        return
+                    end
+                    pdf_pct = pct or 0
+                    -- Throttle e-ink repaints (every ~8%).
+                    if pdf_pct - last_paint_pct < 8 and pdf_pct < 100 then
+                        return
+                    end
+                    last_paint_pct = pdf_pct
+                    local label = string.format(
+                        _("Scanning PDF… %d%% (%d)"),
+                        pdf_pct,
+                        annot_count or 0
+                    )
+                    refreshMenu(menu, items, filter, label)
+                    paintSoon()
+                end,
+                on_done = function(list)
+                    if closed then
+                        return
+                    end
+                    embedded = type(list) == "table" and list or {}
+                    pdf_done = true
+                    rebuildMerged(nil, not zotero_done)
+                end,
+            })
+        end)
     end
 end
 

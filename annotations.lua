@@ -80,7 +80,7 @@ local K2Z_STYLE = {
     ["lighten"] = "highlight",
     ["strikeout"] = "highlight",
     ["invert"] = "highlight",
-    -- PDF embedded squiggly (e.g. BOOX) mapped to underline drawer upstream;
+    -- PDF embedded squiggly mapped to underline drawer upstream;
     -- keep an explicit entry if a raw drawer ever appears.
     ["squiggly"] = "underline",
 }
